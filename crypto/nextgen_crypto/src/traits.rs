@@ -169,6 +169,14 @@ pub trait VerifyingKey:
     ) -> Result<()> {
         signature.verify(message, self)
     }
+
+    /// We provide the implementation which dispatches to the signature.
+    fn batch_verify_signatures(
+        message: &HashValue,
+        keys_and_signatures: Vec<(Self, Self::SignatureMaterial)>,
+    ) -> Result<()> {
+        Self::SignatureMaterial::batch_verify_signatures(message, keys_and_signatures)
+    }
 }
 
 /// A type family for signature material that knows which public key type
@@ -203,10 +211,20 @@ pub trait Signature:
 
     /// Convert the signature into a byte representation.
     fn to_bytes(&self) -> Vec<u8>;
-}
 
-/// An alias for the RNG used in the [`Uniform`] trait.
-pub trait SeedableCryptoRng = ::rand::SeedableRng + ::rand::RngCore + ::rand::CryptoRng;
+    /// The implementer can override a batch verification implementation
+    /// that by default iterates over each signature. More efficient
+    /// implementations exist and should be implemented for many schemes.
+    fn batch_verify_signatures(
+        message: &HashValue,
+        keys_and_signatures: Vec<(Self::VerifyingKeyMaterial, Self)>,
+    ) -> Result<()> {
+        for (key, signature) in keys_and_signatures {
+            signature.verify(message, &key)?
+        }
+        Ok(())
+    }
+}
 
 /// A type family for schemes which know how to generate key material from
 /// a cryptographically-secure [`CryptoRng`][::rand::CryptoRng].
@@ -214,7 +232,7 @@ pub trait Uniform {
     /// Generate key material from an RNG for testing purposes.
     fn generate_for_testing<R>(rng: &mut R) -> Self
     where
-        R: SeedableCryptoRng;
+        R: ::rand::SeedableRng + ::rand::RngCore + ::rand::CryptoRng;
 }
 
 /// A type family with a by-convention notion of genesis private key.

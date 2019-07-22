@@ -165,7 +165,7 @@ impl SigningKey for Ed25519PrivateKey {
 impl Uniform for Ed25519PrivateKey {
     fn generate_for_testing<R>(rng: &mut R) -> Self
     where
-        R: SeedableCryptoRng,
+        R: ::rand::SeedableRng + ::rand::RngCore + ::rand::CryptoRng,
     {
         Ed25519PrivateKey(ed25519_dalek::SecretKey::generate(rng))
     }
@@ -323,6 +323,29 @@ impl Signature for Ed25519Signature {
             .and(Ok(()))
     }
 
+    /// Batch signature verification as described in the original EdDSA article
+    /// by Bernstein et al. "High-speed high-security signatures". Current implementation works for
+    /// signatures on the same message and it checks for malleability.
+    fn batch_verify_signatures(
+        message: &HashValue,
+        keys_and_signatures: Vec<(Self::VerifyingKeyMaterial, Self)>,
+    ) -> Result<()> {
+        for (_, sig) in keys_and_signatures.iter() {
+            Ed25519Signature::check_malleability(&sig.to_bytes())?
+        }
+        let batch_argument = keys_and_signatures
+            .into_iter()
+            .map(|(key, signature)| (key.0, signature.0));
+        let (dalek_public_keys, dalek_signatures): (Vec<_>, Vec<_>) = batch_argument.unzip();
+        let message_ref = &message.as_ref()[..];
+        // The original batching algorithm works for different messages and it expects as many
+        // messages as the number of signatures. In our case, we just populate the same
+        // message to meet dalek's api requirements.
+        let messages = vec![message_ref; dalek_signatures.len()];
+        ed25519_dalek::verify_batch(&messages[..], &dalek_signatures[..], &dalek_public_keys[..])?;
+        Ok(())
+    }
+
     fn to_bytes(&self) -> Vec<u8> {
         self.0.to_bytes().to_vec()
     }
@@ -362,7 +385,17 @@ impl Eq for Ed25519Signature {}
 /// disappear after
 pub mod compat {
     use crate::ed25519::*;
-    use crypto::{PublicKey as LegacyPublicKey, Signature as LegacySignature};
+    #[cfg(any(test, feature = "testing"))]
+    use bincode::deserialize;
+    use bincode::serialize;
+    use crypto::{
+        PrivateKey as LegacyPrivateKey, PublicKey as LegacyPublicKey, Signature as LegacySignature,
+    };
+    #[cfg(any(test, feature = "testing"))]
+    use proptest::{
+        prelude::{Arbitrary, BoxedStrategy},
+        strategy::{LazyJust, Strategy},
+    };
 
     impl From<Ed25519PublicKey> for LegacyPublicKey {
         fn from(public_key: Ed25519PublicKey) -> Self {
@@ -373,6 +406,40 @@ pub mod compat {
     impl From<Ed25519Signature> for LegacySignature {
         fn from(signature: Ed25519Signature) -> Self {
             LegacySignature::from_compact(&signature.to_bytes()).unwrap()
+        }
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    impl From<Ed25519PrivateKey> for LegacyPrivateKey {
+        fn from(private_key: Ed25519PrivateKey) -> Self {
+            // bincode requires size-padding on 8 bytes before the
+            // serialized material — so we reproduce this technique
+            let mut res = vec![
+                ed25519_dalek::SECRET_KEY_LENGTH as u8,
+                0u8,
+                0u8,
+                0u8,
+                0u8,
+                0u8,
+                0u8,
+                0u8,
+            ];
+            let serialized: Vec<u8> = private_key.to_bytes().to_vec();
+            res.extend(serialized);
+            deserialize::<LegacyPrivateKey>(&res).unwrap()
+        }
+    }
+
+    // This is impossible to activate due to reliance on private key
+    // conversion from legacy in chained_bft_consensus_provider.
+    // TODO: remove this when NodeConfig accepts nextgen_config keys
+    // #[cfg(any(test, feature = "testing"))]
+    impl From<LegacyPrivateKey> for Ed25519PrivateKey {
+        fn from(private_key: LegacyPrivateKey) -> Self {
+            let serialized: Vec<u8> = serialize(&private_key).unwrap();
+            // The 8th index here is due to bincode's serialization, which
+            // preprends 8 bytes of size information to the serialized material
+            Ed25519PrivateKey::try_from(&serialized[8..]).unwrap()
         }
     }
 
@@ -389,6 +456,37 @@ pub mod compat {
             let data = sig.to_compact();
             Ed25519Signature(ed25519_dalek::Signature::from_bytes(&data).unwrap())
         }
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    impl Clone for Ed25519PrivateKey {
+        fn clone(&self) -> Self {
+            let serialized: &[u8] = &(self.to_bytes());
+            Ed25519PrivateKey::try_from(serialized).unwrap()
+        }
+    }
+
+    use rand::{rngs::StdRng, SeedableRng};
+    /// Generate an arbitrary key pair, with possible Rng input
+    pub fn generate_keypair<'a, T>(opt_rng: T) -> (Ed25519PrivateKey, Ed25519PublicKey)
+    where
+        T: Into<Option<&'a mut StdRng>> + Sized,
+    {
+        if let Some(rng_mut_ref) = opt_rng.into() {
+            <(Ed25519PrivateKey, Ed25519PublicKey)>::generate_for_testing(rng_mut_ref)
+        } else {
+            let mut rng = StdRng::from_seed(crate::test_utils::TEST_SEED);
+            <(Ed25519PrivateKey, Ed25519PublicKey)>::generate_for_testing(&mut rng)
+        }
+    }
+
+    #[cfg(any(test, feature = "testing"))]
+    impl Arbitrary for Ed25519PublicKey {
+        fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+            LazyJust::new(|| generate_keypair(None).1).boxed()
+        }
+        type Strategy = BoxedStrategy<Self>;
+        type Parameters = ();
     }
 
 }
