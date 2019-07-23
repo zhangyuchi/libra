@@ -17,6 +17,7 @@ use num_traits::{
 };
 use proto_conv::{FromProtoBytes, IntoProto};
 use rust_decimal::Decimal;
+use serde_json;
 use std::{
     collections::HashMap,
     convert::TryFrom,
@@ -40,7 +41,9 @@ use types::{
     },
     account_state_blob::{AccountStateBlob, AccountStateWithProof},
     contract_event::{ContractEvent, EventWithProof},
-    transaction::{Program, RawTransaction, SignedTransaction, Version},
+    transaction::{
+        parse_as_transaction_argument, Program, RawTransaction, SignedTransaction, Version,
+    },
     transaction_helpers::{create_signed_txn, TransactionSigner},
     validator_verifier::ValidatorVerifier,
 };
@@ -309,7 +312,7 @@ impl ClientProxy {
             {
                 println!("transaction is stored!");
                 if events.is_empty() {
-                    println!("but it didn't emit any events (failed execution)");
+                    println!("but it didn't emit any events");
                 }
                 break;
             } else if max_iterations == 0 {
@@ -424,10 +427,16 @@ impl ClientProxy {
 
     /// Compile move program
     pub fn compile_program(&mut self, space_delim_strings: &[&str]) -> Result<String> {
-        let file_path = space_delim_strings[1];
+        let address = self.get_account_address_from_parameter(space_delim_strings[1])?;
+        let file_path = space_delim_strings[2];
+        let is_module = if space_delim_strings.len() > 3 {
+            parse_bool(space_delim_strings[3])?
+        } else {
+            false
+        };
         let output_path = {
-            if space_delim_strings.len() == 3 {
-                space_delim_strings[2].to_string()
+            if space_delim_strings.len() == 5 {
+                space_delim_strings[4].to_string()
             } else {
                 let tmp_path = NamedTempFile::new()?.into_temp_path();
                 let path = tmp_path.to_str().unwrap().to_string();
@@ -435,7 +444,34 @@ impl ClientProxy {
                 path
             }
         };
-        let args = format!("run -p compiler -- -o {} {}", output_path, file_path);
+        // custom handler of old module format
+        // TODO: eventually retire code after vm separation between modules and scripts
+        let tmp_source = if is_module {
+            let mut tmp_file = NamedTempFile::new()?;
+            let code = format!(
+                "\
+                 modules:\n\
+                 {}\n\
+                 script:\n\
+                 main(){{\n\
+                 return;\n\
+                 }}",
+                fs::read_to_string(file_path)?
+            );
+            writeln!(tmp_file, "{}", code)?;
+            Some(tmp_file)
+        } else {
+            None
+        };
+
+        let source_path = tmp_source
+            .as_ref()
+            .map(|f| f.path().to_str().unwrap())
+            .unwrap_or(file_path);
+        let args = format!(
+            "run -p compiler -- -a {} -o {} {}",
+            address, output_path, source_path
+        );
         let status = Command::new("cargo")
             .args(args.split(' '))
             .spawn()?
@@ -444,6 +480,41 @@ impl ClientProxy {
             return Err(format_err!("compilation failed"));
         }
         Ok(output_path)
+    }
+
+    fn submit_program(&mut self, space_delim_strings: &[&str], program: Program) -> Result<()> {
+        let sender_address = self.get_account_address_from_parameter(space_delim_strings[1])?;
+        let sender_ref_id = self.get_account_ref_id(&sender_address)?;
+        let sender = self.accounts.get(sender_ref_id).unwrap();
+        let sequence_number = sender.sequence_number;
+
+        let req = self.create_submit_transaction_req(program, &sender, None, None)?;
+
+        self.client
+            .submit_transaction(self.accounts.get_mut(sender_ref_id), &req)?;
+        self.wait_for_transaction(sender_address, sequence_number + 1);
+
+        Ok(())
+    }
+
+    /// Publish move module
+    pub fn publish_module(&mut self, space_delim_strings: &[&str]) -> Result<()> {
+        let program = serde_json::from_slice(&fs::read(space_delim_strings[2])?)?;
+        self.submit_program(space_delim_strings, program)
+    }
+
+    /// Execute custom script
+    pub fn execute_script(&mut self, space_delim_strings: &[&str]) -> Result<()> {
+        let program: Program = serde_json::from_slice(&fs::read(space_delim_strings[2])?)?;
+        let arguments: Vec<_> = space_delim_strings[3..]
+            .iter()
+            .filter_map(|arg| parse_as_transaction_argument(arg).ok())
+            .collect();
+        let (script, _, modules) = program.into_inner();
+        self.submit_program(
+            space_delim_strings,
+            Program::new(script, modules, arguments),
+        )
     }
 
     /// Submit a transaction to the network.
