@@ -28,7 +28,7 @@ fn test_liveness(
             let tx_reqs = bm.gen_ring_txn_requests(accounts);
             repeated_tx_reqs.extend(tx_reqs.into_iter());
         }
-        bm.submit_and_wait_txn_committed(&repeated_tx_reqs);
+        bm.submit_and_wait_txn_committed(&repeated_tx_reqs, accounts);
     }
 }
 
@@ -53,7 +53,7 @@ pub(crate) fn measure_throughput(
             let tx_reqs = bm.gen_pairwise_txn_requests(accounts);
             repeated_tx_reqs.extend(tx_reqs.into_iter());
         }
-        let txn_throughput = bm.measure_txn_throughput(&repeated_tx_reqs);
+        let txn_throughput = bm.measure_txn_throughput(&repeated_tx_reqs, accounts);
         txn_throughput_seq.push(txn_throughput);
     }
     info!(
@@ -92,7 +92,7 @@ pub(crate) fn create_benchmarker_from_opt(args: &Opt) -> Benchmarker {
             .expect("failed to parse debug_address"),
     );
     // Ready to instantiate Benchmarker.
-    Benchmarker::new(clients, debug_client)
+    Benchmarker::new(clients, debug_client, args.stagger_range_ms)
 }
 
 /// Benchmarker is not a long-lived job, so starting a server and expecting it to be polled
@@ -162,6 +162,7 @@ mod tests {
                 num_accounts: 4,
                 free_lunch: 10_000_000,
                 num_clients: 4,
+                stagger_range_ms: 1,
                 num_rounds: 4,
                 num_epochs: 2,
                 executable: Executable::MeasureThroughput,
