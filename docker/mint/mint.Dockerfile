@@ -15,7 +15,7 @@ COPY rust-toolchain /libra/rust-toolchain
 RUN rustup install $(cat rust-toolchain)
 
 COPY . /libra
-RUN cargo build -p client --release
+RUN cargo build --release -p libra_node -p client
 
 ### Production Image ###
 FROM debian:stretch
@@ -39,8 +39,8 @@ COPY docker/mint/server.py /opt/libra/bin
 # Mint proxy listening address
 EXPOSE 8000
 
-# Define TRUSTED_PEERS, MINT_KEY, AC_HOST and AC_PORT environment variables when running
-CMD cd /opt/libra/etc && echo "$TRUSTED_PEERS" > trusted_peers.config.toml && echo "$MINT_KEY" | \
+# Define MINT_KEY, AC_HOST and AC_PORT environment variables when running
+CMD cd /opt/libra/etc && echo "$MINT_KEY" | \
     base64 -d > mint.key && \
     cd /opt/libra/bin && \
     gunicorn --bind 0.0.0.0:8000 --access-logfile - --error-logfile - --log-level $LOG_LEVEL server

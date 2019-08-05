@@ -15,6 +15,7 @@ use crypto::{
 use failure::prelude::*;
 use hex;
 use nextgen_crypto::{ed25519::*, VerifyingKey};
+#[cfg(any(test, feature = "testing"))]
 use proptest_derive::Arbitrary;
 use proto_conv::{FromProto, IntoProto};
 use rand::{rngs::OsRng, Rng};
@@ -30,9 +31,8 @@ const LIBRA_NETWORK_ID_SHORT: &str = "lb";
 
 /// A struct that represents an account address.
 /// Currently Public Key is used.
-#[derive(
-    Arbitrary, Ord, PartialOrd, Eq, PartialEq, Hash, Default, Clone, Serialize, Deserialize, Copy,
-)]
+#[derive(Ord, PartialOrd, Eq, PartialEq, Hash, Default, Clone, Serialize, Deserialize, Copy)]
+#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
 pub struct AccountAddress([u8; ADDRESS_LENGTH]);
 
 impl AccountAddress {
@@ -64,6 +64,26 @@ impl AccountAddress {
         keccak.update(&public_key.to_bytes());
         keccak.finalize(&mut hash);
         AccountAddress::new(hash)
+    }
+
+    pub fn from_hex_literal(literal: &str) -> Result<Self> {
+        let mut hex_string = String::from(&literal[2..]);
+        if hex_string.len() % 2 != 0 {
+            hex_string.insert(0, '0');
+        }
+
+        let mut result = hex::decode(hex_string.as_str())?;
+        let len = result.len();
+        if len < 32 {
+            result.reverse();
+            for _ in len..32 {
+                result.push(0);
+            }
+            result.reverse();
+        }
+
+        assert!(result.len() >= 32);
+        AccountAddress::try_from(result)
     }
 }
 

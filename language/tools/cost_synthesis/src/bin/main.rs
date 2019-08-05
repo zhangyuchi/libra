@@ -15,8 +15,13 @@ use cost_synthesis::{
 };
 use csv;
 use language_e2e_tests::data_store::FakeDataStore;
-use move_ir_natives::hash;
-use std::{collections::HashMap, convert::TryFrom, path::Path, time::Instant, u64};
+use std::{
+    collections::{HashMap, VecDeque},
+    convert::TryFrom,
+    path::Path,
+    time::Instant,
+    u64,
+};
 use structopt::StructOpt;
 use vm::{
     errors::VMErrorKind,
@@ -33,6 +38,7 @@ use vm_runtime::{
     loaded_data::function::{FunctionRef, FunctionReference},
     txn_executor::TransactionExecutor,
 };
+use vm_runtime_types::{native_functions::hash, value::Local};
 
 #[derive(Debug, StructOpt)]
 #[structopt(
@@ -183,9 +189,10 @@ macro_rules! bench_native {
             .map(|i| {
                 stack_access.set_hash_length(i);
                 let time = (0..$iters).fold(0, |acc, _| {
-                    stack_access.next_bytearray();
                     let before = Instant::now();
-                    let _ = $function(&mut stack_access).unwrap();
+                    let mut args = VecDeque::new();
+                    args.push_front(Local::bytearray(stack_access.next_bytearray()));
+                    let _ = $function(args);
                     acc + before.elapsed().as_nanos()
                 });
                 // Time per byte averaged over the number of iterations that we performed.

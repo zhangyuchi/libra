@@ -34,7 +34,7 @@ fn get_config() -> NodeConfig {
     let config = NodeConfigHelpers::get_single_node_test_config(true);
     // Write out the genesis blob to the correct location.
     // XXX Should this logic live in NodeConfigHelpers?
-    let genesis_txn = encode_genesis_transaction(&GENESIS_KEYPAIR.0, GENESIS_KEYPAIR.1);
+    let genesis_txn = encode_genesis_transaction(&GENESIS_KEYPAIR.0, GENESIS_KEYPAIR.1.clone());
     let mut file = File::create(&config.execution.genesis_file_location).unwrap();
     file.write_all(&genesis_txn.into_proto_bytes().unwrap())
         .unwrap();
@@ -74,6 +74,7 @@ fn create_executor(config: &NodeConfig) -> Executor<MockVM> {
         Arc::clone(&client_env),
         "localhost",
         config.storage.port,
+        None,
     ));
     Executor::new(read_client, write_client, config)
 }

@@ -170,6 +170,7 @@ fn get_mock_response_item(request_item: &ProtoRequestItem) -> Result<ProtoRespon
                     types::byte_array::ByteArray::new(vec![]),
                     0,
                     0,
+                    false,
                 );
                 version_data.insert(
                     types::account_config::account_resource_path(),
@@ -242,7 +243,8 @@ fn get_mock_txn_data(
     let mut txns = vec![];
     let mut infos = vec![];
     for i in start_seq..=end_seq {
-        let signed_txn = get_test_signed_txn(address, i, priv_key.clone(), pub_key, None);
+        let signed_txn =
+            get_test_signed_txn(address, i, priv_key.clone().into(), pub_key.into(), None);
         txns.push(signed_txn);
 
         let info = get_transaction_info().into_proto();

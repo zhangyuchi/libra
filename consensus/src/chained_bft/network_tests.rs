@@ -4,8 +4,9 @@
 use crate::{
     chained_bft::{
         common::Author,
-        consensus_types::{block::Block, quorum_cert::QuorumCert},
-        liveness::proposer_election::ProposalInfo,
+        consensus_types::{
+            block::Block, proposal_info::ProposalInfo, quorum_cert::QuorumCert, sync_info::SyncInfo,
+        },
         network::{BlockRetrievalResponse, ConsensusNetworkImpl, NetworkReceivers},
         safety::vote_msg::VoteMsg,
         test_utils::{consensus_runtime, placeholder_ledger_info},
@@ -13,7 +14,7 @@ use crate::{
     state_replication::ExecutedState,
 };
 use channel;
-use crypto::{signing::generate_keypair, HashValue};
+use crypto::HashValue;
 use futures::{channel::mpsc, executor::block_on, FutureExt, SinkExt, StreamExt, TryFutureExt};
 use network::{
     interface::{NetworkNotification, NetworkRequest},
@@ -261,9 +262,14 @@ impl NetworkPlayground {
         msg_copy.1.has_vote()
     }
 
-    /// Returns true for new round messages only.
-    pub fn new_round_only(msg_copy: &(Author, ConsensusMsg)) -> bool {
+    /// Returns true for timeout messages only.
+    pub fn timeout_msg_only(msg_copy: &(Author, ConsensusMsg)) -> bool {
         msg_copy.1.has_timeout_msg()
+    }
+
+    /// Returns true for sync info messages only.
+    pub fn sync_info_only(msg_copy: &(Author, ConsensusMsg)) -> bool {
+        msg_copy.1.has_sync_info()
     }
 
     fn is_message_dropped(&self, src: &Author, net_req: &NetworkRequest) -> bool {
@@ -358,6 +364,10 @@ fn test_network_api() {
         HashValue::random(),
         ExecutedState::state_for_genesis(),
         1,
+        HashValue::random(),
+        0,
+        HashValue::random(),
+        0,
         peers[0],
         placeholder_ledger_info(),
         &signers[0],
@@ -367,8 +377,7 @@ fn test_network_api() {
     let proposal = ProposalInfo {
         proposal: Block::make_block(&previous_block, 0, 1, 0, previous_qc.clone(), &signers[0]),
         proposer_info: signers[0].author(),
-        timeout_certificate: None,
-        highest_ledger_info: previous_qc,
+        sync_info: SyncInfo::new(previous_qc.clone(), previous_qc.clone(), None),
     };
     block_on(async move {
         nodes[0].send_vote(vote.clone(), peers[2..5].to_vec()).await;
@@ -462,7 +471,7 @@ fn test_rpc() {
     let mut chunk_retrieval = receiver_1.chunk_retrieval;
     let on_request_chunk = async move {
         while let Some(request) = chunk_retrieval.next().await {
-            let keypair = generate_keypair();
+            let keypair = compat::generate_keypair(None);
             let proto_txn =
                 get_test_signed_txn(AccountAddress::random(), 0, keypair.0, keypair.1, None);
             let txn = SignedTransaction::from_proto(proto_txn).unwrap();
@@ -496,6 +505,10 @@ fn test_rpc() {
                     version: 0,
                 },
                 0,
+                HashValue::zero(),
+                0,
+                HashValue::zero(),
+                0,
             )
             .to_vec(),
         );
@@ -506,6 +519,10 @@ fn test_rpc() {
         target.set_state_id(HashValue::zero().into());
         target.set_round(0);
         target.set_signed_ledger_info(ledger_info_with_sigs);
+        target.set_parent_block_id(HashValue::zero().into());
+        target.set_parent_block_round(0);
+        target.set_grandparent_block_id(HashValue::zero().into());
+        target.set_grandparent_block_round(0);
         let mut req = RequestChunk::new();
         req.set_start_version(0);
         req.set_batch_size(1);

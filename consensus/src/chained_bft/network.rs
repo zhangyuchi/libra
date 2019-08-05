@@ -5,8 +5,13 @@ use crate::{
     chained_bft::{
         block_storage::BlockRetrievalFailure,
         common::{Author, Payload},
-        consensus_types::{block::Block, quorum_cert::QuorumCert, timeout_msg::TimeoutMsg},
-        liveness::proposer_election::{ProposalInfo, ProposerInfo},
+        consensus_types::{
+            block::Block,
+            proposal_info::{ProposalInfo, ProposerInfo},
+            quorum_cert::QuorumCert,
+            sync_info::SyncInfo,
+            timeout_msg::TimeoutMsg,
+        },
         safety::vote_msg::VoteMsg,
     },
     counters,
@@ -32,7 +37,10 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::runtime::TaskExecutor;
-use types::{transaction::TransactionListWithProof, validator_verifier::ValidatorVerifier};
+use types::{
+    account_address::AccountAddress, transaction::TransactionListWithProof,
+    validator_verifier::ValidatorVerifier,
+};
 
 /// The response sent back from EventProcessor for the BlockRetrievalRequest.
 #[derive(Debug)]
@@ -67,6 +75,7 @@ impl<T: Payload> BlockRetrievalResponse<T> {
 
 /// BlockRetrievalRequest carries a block id for the requested block as well as the
 /// oneshot sender to deliver the response.
+#[derive(Debug)]
 pub struct BlockRetrievalRequest<T> {
     pub block_id: HashValue,
     pub num_blocks: u64,
@@ -75,6 +84,7 @@ pub struct BlockRetrievalRequest<T> {
 
 /// Represents a request to get up to batch_size transactions starting from start_version
 /// with the oneshot sender to deliver the response.
+#[derive(Debug)]
 pub struct ChunkRetrievalRequest {
     pub start_version: u64,
     pub target: QuorumCert,
@@ -83,10 +93,6 @@ pub struct ChunkRetrievalRequest {
 }
 
 /// Just a convenience struct to keep all the network proxy receiving queues in one place.
-/// 1. proposals
-/// 2. votes
-/// 3. block retrieval requests (the request carries a oneshot sender for returning the Block)
-/// 4. pacemaker timeouts
 /// Will be returned by the networking trait upon startup.
 pub struct NetworkReceivers<T, P> {
     pub proposals: channel::Receiver<ProposalInfo<T, P>>,
@@ -94,6 +100,7 @@ pub struct NetworkReceivers<T, P> {
     pub block_retrieval: channel::Receiver<BlockRetrievalRequest<T>>,
     pub timeout_msgs: channel::Receiver<TimeoutMsg>,
     pub chunk_retrieval: channel::Receiver<ChunkRetrievalRequest>,
+    pub sync_info_msgs: channel::Receiver<(SyncInfo, AccountAddress)>,
 }
 
 /// Implements the actual networking support for all consensus messaging.
@@ -155,8 +162,9 @@ impl ConsensusNetworkImpl {
             channel::new(1_024, &counters::PENDING_BLOCK_REQUESTS);
         let (chunk_request_tx, chunk_request_rx) =
             channel::new(1_024, &counters::PENDING_CHUNK_REQUESTS);
-        let (new_round_tx, new_round_rx) =
+        let (timeout_msg_tx, timeout_msg_rx) =
             channel::new(1_024, &counters::PENDING_NEW_ROUND_MESSAGES);
+        let (sync_info_tx, sync_info_rx) = channel::new(1_024, &counters::PENDING_SYNC_INFO_MSGS);
         let network_events = self
             .network_events
             .take()
@@ -174,7 +182,8 @@ impl ConsensusNetworkImpl {
                 vote_tx,
                 block_request_tx,
                 chunk_request_tx,
-                timeout_msg_tx: new_round_tx,
+                timeout_msg_tx,
+                sync_info_tx,
                 all_events,
                 validator,
             }
@@ -187,8 +196,9 @@ impl ConsensusNetworkImpl {
             proposals: proposal_rx,
             votes: vote_rx,
             block_retrieval: block_request_rx,
-            timeout_msgs: new_round_rx,
+            timeout_msgs: timeout_msg_rx,
             chunk_retrieval: chunk_request_rx,
+            sync_info_msgs: sync_info_rx,
         }
     }
 
@@ -306,6 +316,25 @@ impl ConsensusNetworkImpl {
         msg.set_timeout_msg(timeout_msg.into_proto());
         self.broadcast(msg).await
     }
+
+    /// Sends the given sync info to the given author.
+    /// The future is fulfilled as soon as the message is added to the internal network channel
+    /// (does not indicate whether the message is delivered or sent out).
+    pub async fn send_sync_info(&self, sync_info: SyncInfo, recipient: Author) {
+        if recipient == self.author {
+            error!("An attempt to deliver sync info msg to itself: ignore.");
+            return;
+        }
+        let mut msg = ConsensusMsg::new();
+        msg.set_sync_info(sync_info.into_proto());
+        let mut network_sender = self.network_sender.clone();
+        if let Err(e) = network_sender.send_to(recipient, msg).await {
+            warn!(
+                "Failed to send a sync info msg to peer {:?}: {:?}",
+                recipient, e
+            );
+        }
+    }
 }
 
 struct NetworkTask<T, P, S> {
@@ -314,6 +343,7 @@ struct NetworkTask<T, P, S> {
     block_request_tx: channel::Sender<BlockRetrievalRequest<T>>,
     chunk_request_tx: channel::Sender<ChunkRetrievalRequest>,
     timeout_msg_tx: channel::Sender<TimeoutMsg>,
+    sync_info_tx: channel::Sender<(SyncInfo, AccountAddress)>,
     all_events: S,
     validator: Arc<ValidatorVerifier<Ed25519PublicKey>>,
 }
@@ -334,6 +364,8 @@ where
                         self.process_vote(&mut msg).await
                     } else if msg.has_timeout_msg() {
                         self.process_timeout_msg(&mut msg).await
+                    } else if msg.has_sync_info() {
+                        self.process_sync_info(&mut msg, peer_id).await
                     } else {
                         warn!("Unexpected msg from {}: {:?}", peer_id, msg);
                         continue;
@@ -406,6 +438,23 @@ where
             e
         })?;
         self.timeout_msg_tx.send(timeout_msg).await?;
+        Ok(())
+    }
+
+    async fn process_sync_info<'a>(
+        &'a mut self,
+        msg: &'a mut ConsensusMsg,
+        peer: AccountAddress,
+    ) -> failure::Result<()> {
+        let sync_info = SyncInfo::from_proto(msg.take_sync_info())?;
+        sync_info.verify(self.validator.as_ref()).map_err(|e| {
+            security_log(SecurityEvent::InvalidSyncInfoMsg)
+                .error(&e)
+                .data(&sync_info)
+                .log();
+            e
+        })?;
+        self.sync_info_tx.send((sync_info, peer)).await?;
         Ok(())
     }
 

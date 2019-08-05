@@ -8,7 +8,7 @@ use admission_control_proto::proto::{
     },
     admission_control_grpc::AdmissionControlClient,
 };
-use client::{AccountData, AccountStatus};
+use client::AccountStatus;
 use failure::prelude::*;
 use futures::{
     stream::{self, Stream},
@@ -24,7 +24,7 @@ use types::{
     get_with_proof::{RequestItem, ResponseItem, UpdateToLatestLedgerRequest},
 };
 
-use crate::OP_COUNTER;
+use crate::{submit_rate::ConstantRate, OP_COUNTER};
 
 /// Timeout duration for grpc call option.
 const GRPC_TIMEOUT_MS: u64 = 8_000;
@@ -87,16 +87,18 @@ fn check_ac_response(resp: &ProtoSubmitTransactionResponse) -> bool {
     }
 }
 
-/// Send TXN requests to AC async, wait for and check the responses from AC.
-/// Return the responses of only accepted TXN requests.
+/// Send TXN requests using specified rate to AC async, wait for and check the responses.
+/// Return only the responses of accepted TXN requests.
 /// Ignore but count both gRPC-failed submissions and AC-rejected TXNs.
 pub fn submit_and_wait_txn_requests(
     client: &AdmissionControlClient,
-    txn_requests: &[SubmitTransactionRequest],
+    txn_requests: Vec<SubmitTransactionRequest>,
+    submit_rate: u64,
 ) -> Vec<ProtoSubmitTransactionResponse> {
-    let futures: Vec<_> = txn_requests
-        .iter()
+    let const_rate_iter = ConstantRate::new(submit_rate, txn_requests.into_iter());
+    let futures: Vec<_> = const_rate_iter
         .filter_map(|req| {
+            OP_COUNTER.inc("submit_txns"); // This counter doesn't care if submit succeed or not.
             match client.submit_transaction_async_opt(&req, get_default_grpc_call_option()) {
                 Ok(future) => Some(future),
                 Err(e) => {
@@ -219,16 +221,16 @@ pub fn get_account_states(
 /// Return sender accounts' most recent persisted sequence numbers.
 pub fn sync_account_sequence_number(
     client: &AdmissionControlClient,
-    senders: &[AccountData],
+    senders_and_sequence_numbers: &[(AccountAddress, u64)],
 ) -> HashMap<AccountAddress, u64> {
     // Invariants for the keys in targets (T), unfinished (U) and finished (F):
     // (1) T = U union F, and (2) U and F are disjoint.
-    let targets: HashMap<AccountAddress, u64> = senders
+    let targets: HashMap<AccountAddress, u64> =
+        senders_and_sequence_numbers.iter().cloned().collect();
+    let mut unfinished: HashMap<AccountAddress, u64> = senders_and_sequence_numbers
         .iter()
-        .map(|sender| (sender.address, sender.sequence_number))
+        .map(|(sender, _)| (*sender, 0))
         .collect();
-    let mut unfinished: HashMap<AccountAddress, u64> =
-        senders.iter().map(|sender| (sender.address, 0)).collect();
     let mut finished = HashMap::new();
 
     let mut num_iters = 0;
@@ -251,7 +253,7 @@ pub fn sync_account_sequence_number(
                 }
             }
         }
-        if finished.len() == senders.len() {
+        if finished.len() == senders_and_sequence_numbers.len() {
             break;
         }
         thread::sleep(time::Duration::from_micros(

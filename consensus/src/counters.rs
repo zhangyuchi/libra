@@ -62,6 +62,9 @@ pub static ref TIMEOUT_COUNT: IntCounter = OP_COUNTERS.counter("timeout_count");
 /// The timeout of the current round.
 pub static ref ROUND_TIMEOUT_MS: IntGauge = OP_COUNTERS.gauge("round_timeout_ms");
 
+/// Count the number of cases, in which the vote carried by a timeout message helps to form a QC
+pub static ref TIMEOUT_VOTES_FORM_QC_COUNT: IntCounter = OP_COUNTERS.counter("timeout_votes_form_qc_count");
+
 ////////////////////////
 // SYNCMANAGER COUNTERS
 ////////////////////////
@@ -80,6 +83,12 @@ pub static ref BLOCK_RETRIEVAL_DURATION_MS: Histogram = OP_COUNTERS.histogram("b
 
 /// Histogram of state sync duration.
 pub static ref STATE_SYNC_DURATION_MS: Histogram = OP_COUNTERS.histogram("state_sync_duration_ms");
+
+/// Counts the number of times the sync info message has been set since last restart.
+pub static ref SYNC_INFO_MSGS_SENT_COUNT: IntCounter = OP_COUNTERS.counter("sync_info_msg_sent_count");
+
+/// Counts the number of times the sync info message has been received since last restart.
+pub static ref SYNC_INFO_MSGS_RECEIVED_COUNT: IntCounter = OP_COUNTERS.counter("sync_info_msg_received_count");
 
 //////////////////////
 // RECONFIGURATION COUNTERS
@@ -195,6 +204,9 @@ pub static ref PENDING_PACEMAKER_TIMEOUTS: IntGauge = OP_COUNTERS.gauge("pending
 
 /// Count of the pending new round events.
 pub static ref PENDING_NEW_ROUND_EVENTS: IntGauge = OP_COUNTERS.gauge("pending_new_round_events");
+
+/// Count of the pending sync info messages.
+pub static ref PENDING_SYNC_INFO_MSGS: IntGauge = OP_COUNTERS.gauge("pending_sync_info_msgs");
 
 /// Count of the pending winning proposals.
 pub static ref PENDING_WINNING_PROPOSALS: IntGauge = OP_COUNTERS.gauge("pending_winning_proposals");

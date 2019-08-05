@@ -4,6 +4,7 @@
 use crate::{
     access_path::AccessPath,
     account_address::AccountAddress,
+    account_config::{account_received_event_path, account_sent_event_path},
     account_state_blob::AccountStateBlob,
     byte_array::ByteArray,
     contract_event::ContractEvent,
@@ -19,14 +20,13 @@ use crate::{
     vm_error::VMStatus,
     write_set::{WriteOp, WriteSet, WriteSetMut},
 };
-use crypto::{
-    hash::CryptoHash,
-    signing::{sign_message, PrivateKey as OldPrivateKey, PublicKey as OldPublicKey},
-    utils::{keypair_strategy as gen_keypair_strategy, keypair_strategy},
-    HashValue, Signature,
+use crypto::{hash::CryptoHash, HashValue};
+use nextgen_crypto::{
+    ed25519::{compat::keypair_strategy, *},
+    traits::*,
 };
 use proptest::{
-    collection::{hash_map, hash_set, vec, SizeRange},
+    collection::{hash_map, vec, SizeRange},
     option,
     prelude::*,
     strategy::Union,
@@ -154,30 +154,30 @@ impl SignatureCheckedTransaction {
     // This isn't an Arbitrary impl because this doesn't generate *any* possible SignedTransaction,
     // just one kind of them.
     pub fn program_strategy(
-        keypair_strategy: impl Strategy<Value = (OldPrivateKey, OldPublicKey)>,
+        keypair_strategy: impl Strategy<Value = (Ed25519PrivateKey, Ed25519PublicKey)>,
     ) -> impl Strategy<Value = Self> {
         Self::strategy_impl(keypair_strategy, TransactionPayload::program_strategy())
     }
 
     pub fn write_set_strategy(
-        keypair_strategy: impl Strategy<Value = (OldPrivateKey, OldPublicKey)>,
+        keypair_strategy: impl Strategy<Value = (Ed25519PrivateKey, Ed25519PublicKey)>,
     ) -> impl Strategy<Value = Self> {
         Self::strategy_impl(keypair_strategy, TransactionPayload::write_set_strategy())
     }
 
     pub fn genesis_strategy(
-        keypair_strategy: impl Strategy<Value = (OldPrivateKey, OldPublicKey)>,
+        keypair_strategy: impl Strategy<Value = (Ed25519PrivateKey, Ed25519PublicKey)>,
     ) -> impl Strategy<Value = Self> {
         Self::strategy_impl(keypair_strategy, TransactionPayload::genesis_strategy())
     }
 
     fn strategy_impl(
-        keypair_strategy: impl Strategy<Value = (OldPrivateKey, OldPublicKey)>,
+        keypair_strategy: impl Strategy<Value = (Ed25519PrivateKey, Ed25519PublicKey)>,
         payload_strategy: impl Strategy<Value = TransactionPayload>,
     ) -> impl Strategy<Value = Self> {
         (keypair_strategy, payload_strategy)
             .prop_flat_map(|(keypair, payload)| {
-                let address = AccountAddress::from(keypair.1);
+                let address = AccountAddress::from_public_key(&keypair.1);
                 (
                     Just(keypair),
                     RawTransaction::strategy_impl(Just(address), Just(payload)),
@@ -196,7 +196,7 @@ impl Arbitrary for SignatureCheckedTransaction {
     type Strategy = BoxedStrategy<Self>;
 
     fn arbitrary_with(_args: ()) -> Self::Strategy {
-        Self::strategy_impl(gen_keypair_strategy(), any::<TransactionPayload>()).boxed()
+        Self::strategy_impl(keypair_strategy(), any::<TransactionPayload>()).boxed()
     }
 }
 
@@ -295,9 +295,9 @@ prop_compose! {
     fn arb_validator_signature_for_hash(hash: HashValue)(
         hash in Just(hash),
         (private_key, public_key) in keypair_strategy(),
-    ) -> (AccountAddress, Signature) {
-        let signature = sign_message(hash, &private_key).unwrap();
-        (AccountAddress::from(public_key), signature)
+    ) -> (AccountAddress, Ed25519Signature) {
+        let signature = private_key.sign_message(&hash);
+        (AccountAddress::from_public_key(&public_key), signature)
     }
 }
 
@@ -367,19 +367,16 @@ pub fn renumber_events(
 
 pub fn arb_txn_to_commit_batch(
     num_accounts: usize,
-    num_event_paths: usize,
     num_transactions: usize,
 ) -> impl Strategy<Value = Vec<TransactionToCommit>> {
     (
-        vec(gen_keypair_strategy(), num_accounts),
-        hash_set(any::<Vec<u8>>(), num_event_paths),
+        vec(keypair_strategy(), num_accounts),
         Just(num_transactions),
     )
-        .prop_flat_map(|(keypairs, event_paths, num_transactions)| {
+        .prop_flat_map(|(keypairs, num_transactions)| {
             let keypair_strategy = Union::new(keypairs.into_iter().map(Just)).boxed();
-            let event_path_strategy = Union::new(event_paths.into_iter().map(Just));
             vec(
-                TransactionToCommit::strategy_impl(keypair_strategy, event_path_strategy),
+                TransactionToCommit::strategy_impl(keypair_strategy),
                 num_transactions,
             )
         })
@@ -424,8 +421,7 @@ impl Arbitrary for ContractEvent {
 
 impl TransactionToCommit {
     fn strategy_impl(
-        keypair_strategy: BoxedStrategy<(OldPrivateKey, OldPublicKey)>,
-        event_path_strategy: impl Strategy<Value = Vec<u8>>,
+        keypair_strategy: BoxedStrategy<(Ed25519PrivateKey, Ed25519PublicKey)>,
     ) -> impl Strategy<Value = Self> {
         // signed_txn
         let txn_strategy = SignatureCheckedTransaction::strategy_impl(
@@ -436,11 +432,15 @@ impl TransactionToCommit {
         // acccount_states
         let address_strategy = keypair_strategy
             .clone()
-            .prop_map(|(_, public_key)| AccountAddress::from(public_key));
+            .prop_map(|(_, public_key)| AccountAddress::from_public_key(&public_key));
         let account_states_strategy =
             hash_map(address_strategy.clone(), any::<AccountStateBlob>(), 1..10);
 
         // events
+        let event_path_strategy = prop_oneof![
+            Just(account_sent_event_path()),
+            Just(account_received_event_path()),
+        ];
         let access_path_strategy = (address_strategy, event_path_strategy)
             .prop_map(|(address, path)| AccessPath::new(address, path));
         let events_strategy = vec(ContractEvent::strategy_impl(access_path_strategy), 0..10);
@@ -467,7 +467,7 @@ impl Arbitrary for TransactionToCommit {
     type Strategy = BoxedStrategy<Self>;
 
     fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-        TransactionToCommit::strategy_impl(gen_keypair_strategy().boxed(), any::<Vec<u8>>()).boxed()
+        TransactionToCommit::strategy_impl(keypair_strategy().boxed()).boxed()
     }
 }
 

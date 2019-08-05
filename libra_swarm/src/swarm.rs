@@ -7,10 +7,10 @@ use crate::{
 };
 use config::config::NodeConfig;
 use config_builder::swarm_config::{SwarmConfig, SwarmConfigBuilder};
-use crypto::signing::KeyPair;
 use debug_interface::NodeDebugClient;
 use failure::prelude::*;
 use logger::prelude::*;
+use nextgen_crypto::{ed25519::*, test_utils::KeyPair};
 use std::{
     collections::HashMap,
     env,
@@ -252,7 +252,7 @@ impl LibraSwarm {
     pub fn launch_swarm(
         num_nodes: usize,
         disable_logging: bool,
-        faucet_account_keypair: KeyPair,
+        faucet_account_keypair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey>,
         tee_logs: bool,
         config_dir: Option<String>,
     ) -> Self {
@@ -278,7 +278,7 @@ impl LibraSwarm {
     fn launch_swarm_attempt(
         num_nodes: usize,
         disable_logging: bool,
-        faucet_account_keypair: KeyPair,
+        faucet_account_keypair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey>,
         tee_logs: bool,
         config_dir: &Option<String>,
     ) -> std::result::Result<Self, SwarmLaunchFailure> {
@@ -503,28 +503,25 @@ impl LibraSwarm {
     ) -> std::result::Result<(), SwarmLaunchFailure> {
         // First take the configs out to not keep immutable borrow on self when calling
         // `launch_node`.
-        let mut configs = vec![];
-        for (path, config) in self.config.get_configs() {
-            configs.push((path.clone(), config.clone()));
-        }
-        for (path, config) in configs {
-            if config.base.peer_id == peer_id {
-                return self.launch_node(peer_id, &path, &config, disable_logging);
-            }
-        }
-        panic!(
-            "PeerId {} not found in any of the admission control service ports.",
-            peer_id
-        );
+        self.launch_node(peer_id, disable_logging)
     }
 
     fn launch_node(
         &mut self,
         peer_id: String,
-        path: &PathBuf,
-        config: &NodeConfig,
         disable_logging: bool,
     ) -> std::result::Result<(), SwarmLaunchFailure> {
+        let (path, config) = self
+            .config
+            .get_configs()
+            .iter()
+            .find(|(_path, config)| config.base.peer_id == peer_id)
+            .expect(
+                &format!(
+                    "PeerId {} not found in any of the admission control service ports.",
+                    peer_id
+                )[..],
+            );
         let logs_dir_path = self.dir.as_ref().map(|x| x.as_ref().join("logs")).unwrap();
         let mut node =
             LibraNode::launch(config, path, &logs_dir_path, disable_logging, self.tee_logs)

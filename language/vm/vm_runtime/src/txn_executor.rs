@@ -12,10 +12,9 @@ use crate::{
         function::{FunctionRef, FunctionReference},
         loaded_module::LoadedModule,
     },
-    value::{Local, MutVal, Reference, Value},
 };
 use bytecode_verifier::{VerifiedModule, VerifiedScript};
-use move_ir_natives::dispatch::{dispatch_native_call, NativeReturnType};
+use std::collections::VecDeque;
 use types::{
     access_path::AccessPath,
     account_address::AccountAddress,
@@ -35,6 +34,10 @@ use vm::{
     transaction_metadata::TransactionMetadata,
 };
 use vm_cache_map::Arena;
+use vm_runtime_types::{
+    native_functions::dispatch::{dispatch_native_function, NativeReturnStatus},
+    value::{Local, MutVal, Reference, Value},
+};
 
 #[cfg(test)]
 #[path = "unit_tests/runtime_tests.rs"]
@@ -249,35 +252,52 @@ where
                     .ok_or(VMInvariantViolation::LinkerError)?;
 
                     if callee_function_ref.is_native() {
-                        let module_name: &str = callee_function_ref.module().name();
-                        let function_name: &str = callee_function_ref.name();
-                        let native_return = dispatch_native_call(
-                            &mut self.execution_stack,
-                            module_name,
-                            function_name,
-                        )
-                        .map_err(|_| VMInvariantViolation::LinkerError)?;
-                        try_runtime!(self.gas_meter.consume_gas(
-                            GasUnits::new(native_return.cost()),
-                            &self.execution_stack
-                        ));
-                        match native_return.get_return_value() {
-                            NativeReturnType::ByteArray(value) => {
-                                self.execution_stack.push(Local::bytearray(value));
-                                // Call stack is not reconstructed for a native call, so we just
-                                // proceed on to next instruction.
-                            }
-                            NativeReturnType::Bool(value) => {
-                                self.execution_stack.push(Local::bool(value));
-                                // Call stack is not reconstructed for a native call, so we just
-                                // proceed on to next instruction.
-                            }
-                            NativeReturnType::U64(value) => {
-                                self.execution_stack.push(Local::u64(value));
-                                // Call stack is not reconstructed for a native call, so we just
-                                // proceed on to next instruction.
-                            }
+                        let module = callee_function_ref.module();
+                        let module_id = module.self_id();
+                        let function_name = callee_function_ref.name();
+                        let native_function =
+                            match dispatch_native_function(&module_id, function_name) {
+                                None => return Err(VMInvariantViolation::LinkerError),
+                                Some(native_function) => native_function,
+                            };
+                        let mut arguments = VecDeque::new();
+                        let expected_args = native_function.num_args();
+                        if callee_function_ref.arg_count() != expected_args {
+                            // Should not be possible due to bytecode verifier but this assertion is
+                            // here to make sure the view the type checker had lines up with the
+                            // execution of the native function
+                            return Err(VMInvariantViolation::LinkerError);
                         }
+                        for _ in 0..expected_args {
+                            arguments.push_front(self.execution_stack.pop()?);
+                        }
+                        let (cost, return_values) = match (native_function.dispatch)(arguments) {
+                            NativeReturnStatus::InvalidArguments => {
+                                // TODO: better error
+                                return Err(VMInvariantViolation::LinkerError);
+                            }
+                            NativeReturnStatus::Aborted { cost, error_code } => {
+                                try_runtime!(self
+                                    .gas_meter
+                                    .consume_gas(GasUnits::new(cost), &self.execution_stack));
+                                return Ok(Err(VMRuntimeError {
+                                    loc: self.execution_stack.location()?,
+                                    err: VMErrorKind::Aborted(error_code),
+                                }));
+                            }
+                            NativeReturnStatus::Success {
+                                cost,
+                                return_values,
+                            } => (cost, return_values),
+                        };
+                        try_runtime!(self
+                            .gas_meter
+                            .consume_gas(GasUnits::new(cost), &self.execution_stack));
+                        for value in return_values {
+                            self.execution_stack.push(value);
+                        }
+                    // Call stack is not reconstructed for a native call, so we just
+                    // proceed on to next instruction.
                     } else {
                         self.execution_stack.top_frame_mut()?.jump(pc);
                         try_runtime!(self.execution_stack.push_call(callee_function_ref));
@@ -330,9 +350,10 @@ where
                 Bytecode::Pack(sd_idx, _) => {
                     let self_module = self.execution_stack.top_frame()?.module();
                     let struct_def = self_module.struct_def_at(sd_idx);
+                    let field_count = struct_def.declared_field_count()?;
                     let args = self
                         .execution_stack
-                        .popn(struct_def.field_count)?
+                        .popn(field_count)?
                         .into_iter()
                         .map(Local::value)
                         .collect();

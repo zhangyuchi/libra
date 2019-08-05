@@ -384,7 +384,7 @@ impl LocalPacemaker {
         let timeout_processing_res = { inner.write().unwrap().process_local_timeout(round) };
         if let Some(mut sender) = timeout_processing_res {
             if let Err(e) = sender.send(round).await {
-                warn!("Can't send pacemaker timeout message: {:?}", e)
+                panic!("Error in sending pacemaker timeout message to local channel, uanble to recover: {:?}", e);
             }
         }
     }
@@ -433,5 +433,13 @@ impl Pacemaker for LocalPacemaker {
         if guard.highest_committed_round < highest_committed_round {
             guard.highest_committed_round = highest_committed_round;
         }
+    }
+
+    fn highest_timeout_certificate(&self) -> Option<PacemakerTimeoutCertificate> {
+        let guard = self.inner.read().unwrap();
+        guard
+            .pacemaker_timeout_manager
+            .highest_timeout_certificate()
+            .cloned()
     }
 }

@@ -6,7 +6,7 @@ use crate::{
         block_storage::BlockReader,
         chained_bft_smr::{ChainedBftSMR, ChainedBftSMRConfig},
         common::Author,
-        liveness::proposer_election::ProposalInfo,
+        consensus_types::proposal_info::ProposalInfo,
         network::ConsensusNetworkImpl,
         network_tests::NetworkPlayground,
         safety::vote_msg::VoteMsg,
@@ -477,7 +477,7 @@ fn block_retrieval_with_timeout() {
         // Block RPC and wait until timeout for current round
         playground.drop_message_for(&nodes[2].author, nodes[0].author);
         playground
-            .wait_for_messages(1, NetworkPlayground::new_round_only)
+            .wait_for_messages(1, NetworkPlayground::timeout_msg_only)
             .await;
         // Unblock RPC
         playground.stop_drop_message_for(&nodes[2].author, &nodes[0].author);
@@ -609,7 +609,7 @@ fn state_sync_on_timeout() {
         // (node 0 cannot send to anyone).  Note that there are 6 messages waited on
         // since 2 can timeout 2x while waiting for 1 to timeout.
         playground
-            .wait_for_messages(6, NetworkPlayground::new_round_only)
+            .wait_for_messages(6, NetworkPlayground::timeout_msg_only)
             .await;
 
         let mut node2_commits = vec![];
@@ -625,5 +625,130 @@ fn state_sync_on_timeout() {
                 .consensus_block_id(),
         );
         assert_eq!(node2_commits[0], proposals[6]);
+    });
+}
+
+#[test]
+/// Verify that in case a node receives timeout message from a remote peer that is lagging behind,
+/// then this node sends a sync info, which helps the remote to properly catch up.
+fn sync_info_sent_if_remote_stale() {
+    let runtime = consensus_runtime();
+    let mut playground = NetworkPlayground::new(runtime.executor());
+    // This test depends on the fixed proposer on nodes[0]
+    // We're going to drop messages from 0 to 2: as a result we expect node 2 to broadcast timeout
+    // messages, for which node 1 should respond with sync_info, which should eventually
+    // help node 2 to catch up.
+    let mut nodes = SMRNode::start_num_nodes(3, 2, &mut playground, FixedProposer);
+    block_on(async move {
+        playground.drop_message_for(&nodes[0].author, nodes[2].author);
+        // Don't want to receive timeout messages from 2 until 1 has some real stuff to contribute.
+        playground.drop_message_for(&nodes[2].author, nodes[1].author);
+        for _ in 0..10 {
+            playground
+                .wait_for_messages(1, NetworkPlayground::proposals_only)
+                .await;
+            playground
+                .wait_for_messages(1, NetworkPlayground::votes_only)
+                .await;
+        }
+
+        // Wait for some timeout message from 2 to {0, 1}.
+        playground.stop_drop_message_for(&nodes[2].author, &nodes[1].author);
+        playground
+            .wait_for_messages(2, NetworkPlayground::timeout_msg_only)
+            .await;
+        // Now wait for a sync info message from 1 to 2.
+        playground
+            .wait_for_messages(1, NetworkPlayground::sync_info_only)
+            .await;
+
+        let node2_commit = nodes[2]
+            .commit_cb_receiver
+            .next()
+            .await
+            .unwrap()
+            .ledger_info()
+            .consensus_block_id();
+
+        // Close node 1 channel for new commit callbacks and iterate over all its commits: we should
+        // find the node 2 commit there.
+        let mut found = false;
+        nodes[1].commit_cb_receiver.close();
+        while let Ok(Some(node1_commit)) = nodes[1].commit_cb_receiver.try_next() {
+            let node1_commit_id = node1_commit.ledger_info().consensus_block_id();
+            if node1_commit_id == node2_commit {
+                found = true;
+                break;
+            }
+        }
+
+        assert_eq!(found, true);
+    });
+}
+
+#[test]
+/// Verify that a QC can be formed by aggregating the votes piggybacked by TimeoutMsgs
+fn aggregate_timeout_votes() {
+    let runtime = consensus_runtime();
+    let mut playground = NetworkPlayground::new(runtime.executor());
+
+    // The proposer node[0] sends its proposal to nodes 1 and 2, which cannot respond back,
+    // because their messages are dropped.
+    // Upon timeout nodes 1 and 2 are sending timeout messages with attached votes for the original
+    // proposal: both can then aggregate the QC for the first proposal.
+    let nodes = SMRNode::start_num_nodes(3, 2, &mut playground, FixedProposer);
+    block_on(async move {
+        playground.drop_message_for(&nodes[1].author, nodes[0].author);
+        playground.drop_message_for(&nodes[2].author, nodes[0].author);
+
+        // Node 0 sends proposals to nodes 1 and 2
+        let mut msg = playground
+            .wait_for_messages(2, NetworkPlayground::proposals_only)
+            .await;
+        let first_proposal =
+            ProposalInfo::<Vec<u64>, Author>::from_proto(msg[0].1.take_proposal()).unwrap();
+        let proposal_id = first_proposal.proposal.id();
+        playground.drop_message_for(&nodes[0].author, nodes[1].author);
+        playground.drop_message_for(&nodes[0].author, nodes[2].author);
+
+        // Wait for the timeout messages sent by 1 and 2 to each other
+        playground
+            .wait_for_messages(2, NetworkPlayground::timeout_msg_only)
+            .await;
+
+        // Node 0 cannot form a QC
+        assert_eq!(
+            nodes[0]
+                .smr
+                .block_store()
+                .unwrap()
+                .highest_quorum_cert()
+                .certified_block_round(),
+            0
+        );
+        // Nodes 1 and 2 form a QC and move to the next round.
+        // Wait for the timeout messages from 1 and 2
+        playground
+            .wait_for_messages(2, NetworkPlayground::timeout_msg_only)
+            .await;
+
+        assert_eq!(
+            nodes[1]
+                .smr
+                .block_store()
+                .unwrap()
+                .highest_quorum_cert()
+                .certified_block_id(),
+            proposal_id
+        );
+        assert_eq!(
+            nodes[2]
+                .smr
+                .block_store()
+                .unwrap()
+                .highest_quorum_cert()
+                .certified_block_id(),
+            proposal_id
+        );
     });
 }

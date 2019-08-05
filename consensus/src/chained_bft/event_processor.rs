@@ -9,13 +9,15 @@ use crate::{
         common::{Author, Payload, Round},
         consensus_types::{
             block::Block,
+            proposal_info::{ProposalInfo, ProposerInfo},
+            quorum_cert::QuorumCert,
             sync_info::SyncInfo,
             timeout_msg::{PacemakerTimeout, TimeoutMsg},
         },
         liveness::{
             pacemaker::{NewRoundEvent, NewRoundReason, Pacemaker},
             proposal_generator::ProposalGenerator,
-            proposer_election::{ProposalInfo, ProposerElection, ProposerInfo},
+            proposer_election::ProposerElection,
         },
         network::{
             BlockRetrievalRequest, BlockRetrievalResponse, ChunkRetrievalRequest,
@@ -36,18 +38,17 @@ use logger::prelude::*;
 use network::proto::BlockRetrievalStatus;
 use std::{
     sync::{Arc, RwLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use termion::color::*;
 use types::ledger_info::LedgerInfoWithSignatures;
 
 /// Result of initial proposal processing
-/// NeedFetch means separate task mast be spawned for fetching block
-/// Caller should call fetch_and_process_proposal in separate task when NeedFetch is returned
+/// - Done(true) indicates that the proposal was sent to the proposer election
+/// - NeedSync means separate task mast be spawned for state synchronization in the background
 pub enum ProcessProposalResult<T, P> {
-    Done,
-    NeedFetch(Instant, ProposalInfo<T, P>),
-    NeedSync(Instant, ProposalInfo<T, P>),
+    Done(bool),
+    NeedSync(ProposalInfo<T, P>),
 }
 
 /// Consensus SMR is working in an event based fashion: EventProcessor is responsible for
@@ -69,6 +70,8 @@ pub struct EventProcessor<T, P> {
     sync_manager: SyncManager<T>,
     time_service: Arc<dyn TimeService>,
     enforce_increasing_timestamps: bool,
+    // Cache of the last sent vote message.
+    last_vote_sent: Arc<RwLock<Option<(VoteMsg, Round)>>>,
 }
 
 impl<T: Payload, P: ProposerInfo> EventProcessor<T, P> {
@@ -106,6 +109,7 @@ impl<T: Payload, P: ProposerInfo> EventProcessor<T, P> {
             sync_manager,
             time_service,
             enforce_increasing_timestamps,
+            last_vote_sent: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -164,13 +168,16 @@ impl<T: Payload, P: ProposerInfo> EventProcessor<T, P> {
             NewRoundReason::Timeout { cert } => Some(cert),
             _ => None,
         };
-        let highest_ledger_info = (*self.block_store.highest_ledger_info()).clone();
+        let sync_info = SyncInfo::new(
+            (*proposal.quorum_cert()).clone(),
+            (*self.block_store.highest_ledger_info()).clone(),
+            timeout_certificate,
+        );
         network
             .broadcast_proposal(ProposalInfo {
                 proposal,
                 proposer_info,
-                timeout_certificate,
-                highest_ledger_info,
+                sync_info,
             })
             .await;
         counters::PROPOSALS_COUNT.inc();
@@ -194,6 +201,15 @@ impl<T: Payload, P: ProposerInfo> EventProcessor<T, P> {
         // but it's known that the pacemaker's round is not going to decrease so we can already
         // filter out the proposals from old rounds.
         let current_round = self.pacemaker.current_round();
+        self.help_remote_if_stale(
+            proposal.proposer_info.get_author(),
+            proposal.proposal.round(),
+            proposal
+                .sync_info
+                .highest_quorum_cert()
+                .certified_block_round(),
+        )
+        .await;
         if proposal.proposal.round() < self.pacemaker.current_round() {
             warn!(
                 "Proposal {} is ignored because its round {} != current round {}",
@@ -201,7 +217,7 @@ impl<T: Payload, P: ProposerInfo> EventProcessor<T, P> {
                 proposal.proposal.round(),
                 current_round
             );
-            return ProcessProposalResult::Done;
+            return ProcessProposalResult::Done(false);
         }
         if self
             .proposer_election
@@ -213,20 +229,7 @@ impl<T: Payload, P: ProposerInfo> EventProcessor<T, P> {
                 proposal.proposal.author(),
                 proposal.proposal
             );
-            return ProcessProposalResult::Done;
-        }
-
-        let deadline = self.pacemaker.current_round_deadline();
-        if let Some(committed_block_id) = proposal.highest_ledger_info.committed_block_id() {
-            if self
-                .block_store
-                .need_sync_for_quorum_cert(committed_block_id, &proposal.highest_ledger_info)
-            {
-                return ProcessProposalResult::NeedSync(deadline, proposal);
-            }
-        } else {
-            warn!("Highest ledger info {} has no committed block", proposal);
-            return ProcessProposalResult::Done;
+            return ProcessProposalResult::Done(false);
         }
 
         match self
@@ -234,11 +237,11 @@ impl<T: Payload, P: ProposerInfo> EventProcessor<T, P> {
             .need_fetch_for_quorum_cert(proposal.proposal.quorum_cert())
         {
             NeedFetchResult::NeedFetch => {
-                return ProcessProposalResult::NeedFetch(deadline, proposal)
+                return ProcessProposalResult::NeedSync(proposal);
             }
             NeedFetchResult::QCRoundBeforeRoot => {
                 warn!("Proposal {} has a highest quorum certificate with round older than root round {}", proposal, self.block_store.root().round());
-                return ProcessProposalResult::Done;
+                return ProcessProposalResult::Done(false);
             }
             NeedFetchResult::QCBlockExist => {
                 if let Err(e) = self
@@ -250,26 +253,28 @@ impl<T: Payload, P: ProposerInfo> EventProcessor<T, P> {
                         "Quorum certificate for proposal {} could not be inserted to the block store: {:?}",
                         proposal, e
                     );
-                    return ProcessProposalResult::Done;
+                    return ProcessProposalResult::Done(false);
                 }
             }
             NeedFetchResult::QCAlreadyExist => (),
         }
 
-        self.finish_proposal_processing(proposal).await;
-        ProcessProposalResult::Done
+        self.finish_proposal_processing(proposal).await
     }
 
     /// Finish proposal processing: note that multiple tasks can execute this function in parallel
     /// so be careful with the updates. The safest thing to do is to pass the proposal further
     /// to the proposal election.
     /// This function is invoked when all the dependencies for the given proposal are ready.
-    async fn finish_proposal_processing(&self, proposal: ProposalInfo<T, P>) {
+    async fn finish_proposal_processing(
+        &self,
+        proposal: ProposalInfo<T, P>,
+    ) -> ProcessProposalResult<T, P> {
         let qc = proposal.proposal.quorum_cert();
         self.pacemaker
             .process_certificates(
                 qc.certified_block_round(),
-                proposal.timeout_certificate.as_ref(),
+                proposal.sync_info.highest_timeout_certificate(),
             )
             .await;
 
@@ -281,58 +286,25 @@ impl<T: Payload, P: ProposerInfo> EventProcessor<T, P> {
                 proposal.proposal.round(),
                 current_round
             );
-            return;
+            return ProcessProposalResult::Done(false);
         }
 
         self.proposer_election.process_proposal(proposal).await;
-    }
-
-    /// Fetches and completes processing proposal in dedicated task
-    pub async fn fetch_and_process_proposal(
-        &self,
-        deadline: Instant,
-        proposal: ProposalInfo<T, P>,
-    ) {
-        if let Err(e) = self
-            .sync_manager
-            .fetch_quorum_cert(
-                proposal.proposal.quorum_cert().clone(),
-                proposal.proposer_info.get_author(),
-                deadline,
-            )
-            .await
-        {
-            warn!(
-                "Quorum certificate for proposal {} could not be added to the block store: {:?}",
-                proposal, e
-            );
-            return;
-        }
-        self.finish_proposal_processing(proposal).await;
+        ProcessProposalResult::Done(true)
     }
 
     /// Takes mutable reference to avoid race with other processing and perform state
     /// synchronization, then completes processing proposal in dedicated task
-    pub async fn sync_and_process_proposal(
-        &mut self,
-        deadline: Instant,
-        proposal: ProposalInfo<T, P>,
-    ) {
-        // check if we still need sync
+    pub async fn sync_and_process_proposal(&mut self, proposal: ProposalInfo<T, P>) {
         if let Err(e) = self
-            .sync_manager
-            .sync_to(
-                deadline,
-                SyncMgrContext {
-                    highest_quorum_cert: proposal.proposal.quorum_cert().clone(),
-                    highest_ledger_info: proposal.highest_ledger_info.clone(),
-                    preferred_peer: proposal.proposer_info.get_author(),
-                },
+            .sync_up(
+                &proposal.sync_info,
+                Some(proposal.proposer_info.get_author()),
             )
             .await
         {
             warn!(
-                "Quorum certificate for proposal {} could not be added to the block store: {:?}",
+                "Dependencies of proposal {} could not be added to the block store: {:?}",
                 proposal, e
             );
             return;
@@ -345,51 +317,127 @@ impl<T: Payload, P: ProposerInfo> EventProcessor<T, P> {
     /// a pacemaker timeout certificate is formed with 2f+1 timeouts, the next proposer will be
     /// able to chain a proposal block to a highest quorum certificate such that all honest replicas
     /// can vote for it.
-    pub async fn process_timeout_msg(&mut self, timeout_msg: TimeoutMsg) {
+    pub async fn process_timeout_msg(&mut self, timeout_msg: TimeoutMsg, quorum_size: usize) {
         debug!(
-            "Received a new round msg for round {} from {}",
+            "Received timeout msg for round {} from {}",
             timeout_msg.pacemaker_timeout().round(),
             timeout_msg.author().short_str()
         );
-        let current_highest_quorum_cert_round = self
-            .block_store
-            .highest_quorum_cert()
-            .certified_block_round();
-        let new_round_highest_quorum_cert_round = timeout_msg
-            .sync_info()
-            .highest_quorum_cert()
-            .certified_block_round();
 
-        if current_highest_quorum_cert_round < new_round_highest_quorum_cert_round {
-            // The timeout message carries a QC higher than what this node has seen before:
-            // run state synchronization.
-            let deadline = self.pacemaker.current_round_deadline();
-            match self
-                .sync_manager
-                .sync_to(
-                    deadline,
-                    SyncMgrContext {
-                        highest_quorum_cert: timeout_msg.sync_info().highest_quorum_cert().clone(),
-                        highest_ledger_info: timeout_msg.sync_info().highest_ledger_info().clone(),
-                        preferred_peer: timeout_msg.author(),
-                    },
-                )
-                .await
-                {
-                    Ok(()) => debug!(
-                        "Successfully added new highest quorum certificate at round {} from old round {}",
-                        new_round_highest_quorum_cert_round, current_highest_quorum_cert_round
-                    ),
-                    Err(e) => warn!(
-                        "Unable to insert new highest quorum certificate {} from old round {} due to {:?}",
-                        timeout_msg.sync_info().highest_quorum_cert(),
-                        current_highest_quorum_cert_round,
-                        e
-                    ),
-                }
+        self.help_remote_if_stale(
+            timeout_msg.author(),
+            timeout_msg.pacemaker_timeout().round(),
+            timeout_msg
+                .sync_info()
+                .highest_quorum_cert()
+                .certified_block_round(),
+        )
+        .await;
+
+        if self
+            .sync_up(timeout_msg.sync_info(), Some(timeout_msg.author()))
+            .await
+            .is_err()
+        {
+            warn!("Stop timeout msg processing because of sync up error.");
+            return;
+        };
+        if let Some(vote) = timeout_msg.pacemaker_timeout().vote_msg() {
+            if let Some(_qc) = self.add_vote(vote.clone(), quorum_size).await {
+                counters::TIMEOUT_VOTES_FORM_QC_COUNT.inc();
+            }
         }
         self.pacemaker
             .process_remote_timeout(timeout_msg.pacemaker_timeout().clone())
+            .await;
+    }
+
+    /// In case some peer's round or HQC is stale, send a SyncInfo message to that peer.
+    async fn help_remote_if_stale(
+        &self,
+        peer: Author,
+        remote_round: Round,
+        remote_hqc_round: Round,
+    ) {
+        if self.author.get_author() == peer {
+            return;
+        }
+        if remote_round < self.pacemaker.current_round()
+            || remote_hqc_round
+                < self
+                    .block_store
+                    .highest_quorum_cert()
+                    .certified_block_round()
+        {
+            let sync_info = SyncInfo::new(
+                self.block_store.highest_quorum_cert().as_ref().clone(),
+                self.block_store.highest_ledger_info().as_ref().clone(),
+                self.pacemaker.highest_timeout_certificate(),
+            );
+
+            debug!(
+                "Peer {} is at round {} with hqc round {}, sending it a SyncInfo {}",
+                peer.short_str(),
+                remote_round,
+                remote_hqc_round,
+                sync_info,
+            );
+            counters::SYNC_INFO_MSGS_SENT_COUNT.inc();
+            self.network.send_sync_info(sync_info, peer).await;
+        }
+    }
+
+    /// The function makes sure that it brings the missing dependencies from the QC and LedgerInfo
+    /// of the given sync info.
+    /// Returns Error in case sync mgr failed to bring the missing dependencies.
+    async fn sync_up(
+        &mut self,
+        sync_info: &SyncInfo,
+        preferred_peer: Option<Author>,
+    ) -> failure::Result<()> {
+        let current_hqc_round = self
+            .block_store
+            .highest_quorum_cert()
+            .certified_block_round();
+        let sync_info_hqc_round = sync_info.highest_quorum_cert().certified_block_round();
+
+        if current_hqc_round >= sync_info_hqc_round {
+            return Ok(());
+        }
+
+        debug!(
+            "Starting sync: current_hqc_round = {}, sync_info_hqc_round = {}",
+            current_hqc_round, sync_info_hqc_round,
+        );
+        let deadline = self.pacemaker.current_round_deadline();
+        let sync_mgr_context = SyncMgrContext::new(sync_info, preferred_peer);
+        self.sync_manager
+            .sync_to(deadline, sync_mgr_context)
+            .await
+            .map_err(|e| {
+                warn!(
+                    "Fail to sync up to HQC @ round {}: {:?}",
+                    sync_info_hqc_round, e
+                );
+                e
+            })?;
+        debug!("Caught up to HQC at round {}", sync_info_hqc_round);
+        Ok(())
+    }
+
+    pub async fn process_sync_info_msg(&mut self, sync_info: SyncInfo, peer: Author) {
+        debug!("Received a sync info msg: {}", sync_info);
+        counters::SYNC_INFO_MSGS_RECEIVED_COUNT.inc();
+        // First bring missing dependencies, then update pacemaker.
+        if self.sync_up(&sync_info, Some(peer)).await.is_err() {
+            return;
+        }
+
+        self.pacemaker
+            .process_certificates(
+                sync_info.highest_quorum_cert().certified_block_round(),
+                sync_info.highest_timeout_certificate(),
+            )
             .await;
     }
 
@@ -426,13 +474,23 @@ impl<T: Payload, P: ProposerInfo> EventProcessor<T, P> {
             self.proposer_election.get_valid_proposers(round),
         );
 
+        let vote_msg_with_timeout = match self.last_vote_sent.read().unwrap().as_ref() {
+            Some((vote, vote_round)) => {
+                if *vote_round == round {
+                    Some(vote.clone())
+                } else {
+                    None
+                }
+            }
+            None => None,
+        };
         Some(TimeoutMsg::new(
             SyncInfo::new(
                 self.block_store.highest_quorum_cert().as_ref().clone(),
                 self.block_store.highest_ledger_info().as_ref().clone(),
                 None,
             ),
-            PacemakerTimeout::new(round, self.block_store.signer()),
+            PacemakerTimeout::new(round, self.block_store.signer(), vote_msg_with_timeout),
             self.block_store.signer(),
         ))
     }
@@ -481,60 +539,8 @@ impl<T: Payload, P: ProposerInfo> EventProcessor<T, P> {
             );
             return;
         }
-
-        let current_round_deadline = self.pacemaker.current_round_deadline();
-        if self.enforce_increasing_timestamps {
-            match wait_if_possible(
-                self.time_service.as_ref(),
-                Duration::from_micros(block.timestamp_usecs()),
-                current_round_deadline,
-            )
-            .await
-            {
-                Ok(waiting_success) => {
-                    debug!("Success with {:?} for being able to vote", waiting_success);
-
-                    match waiting_success {
-                        WaitingSuccess::WaitWasRequired { wait_duration, .. } => {
-                            counters::VOTE_SUCCESS_WAIT_MS
-                                .observe(wait_duration.as_millis() as f64);
-                            counters::VOTE_WAIT_WAS_REQUIRED_COUNT.inc();
-                        }
-                        WaitingSuccess::NoWaitRequired { .. } => {
-                            counters::VOTE_SUCCESS_WAIT_MS.observe(0.0);
-                            counters::VOTE_NO_WAIT_REQUIRED_COUNT.inc();
-                        }
-                    }
-                }
-                Err(waiting_error) => {
-                    match waiting_error {
-                        WaitingError::MaxWaitExceeded => {
-                            error!(
-                                "Waiting until proposal block timestamp usecs {:?} would exceed the round duration {:?}, hence will not vote for this round",
-                                block.timestamp_usecs(),
-                                current_round_deadline);
-                            counters::VOTE_FAILURE_WAIT_MS.observe(0.0);
-                            counters::VOTE_MAX_WAIT_EXCEEDED_COUNT.inc();
-                            return;
-                        }
-                        WaitingError::WaitFailed {
-                            current_duration_since_epoch,
-                            wait_duration,
-                        } => {
-                            error!(
-                                "Even after waiting for {:?}, proposal block timestamp usecs {:?} >= current timestamp usecs {:?}, will not vote for this round",
-                                wait_duration,
-                                block.timestamp_usecs(),
-                                current_duration_since_epoch);
-                            counters::VOTE_FAILURE_WAIT_MS
-                                .observe(wait_duration.as_millis() as f64);
-                            counters::VOTE_WAIT_FAILED_COUNT.inc();
-                            return;
-                        }
-                    };
-                }
-            }
-        }
+        self.wait_before_vote_if_needed(block.timestamp_usecs())
+            .await;
 
         let vote_info = match self
             .safety_rules
@@ -568,11 +574,19 @@ impl<T: Payload, P: ProposerInfo> EventProcessor<T, P> {
             proposal_id,
             executed_state,
             block.round(),
+            vote_info.parent_block_id(),
+            vote_info.parent_block_round(),
+            vote_info.grandparent_block_id(),
+            vote_info.grandparent_block_round(),
             self.author.get_author(),
             ledger_info_placeholder,
             self.block_store.signer(),
         );
 
+        self.last_vote_sent
+            .write()
+            .unwrap()
+            .replace((vote_msg.clone(), block.round()));
         let recipients: Vec<Author> = self
             .proposer_election
             .get_valid_proposers(block.round() + 1)
@@ -589,6 +603,62 @@ impl<T: Payload, P: ProposerInfo> EventProcessor<T, P> {
                 .unwrap_or_else(HashValue::zero)
         );
         self.network.send_vote(vote_msg, recipients).await;
+    }
+
+    async fn wait_before_vote_if_needed(&self, block_timestamp_us: u64) {
+        let current_round_deadline = self.pacemaker.current_round_deadline();
+        if self.enforce_increasing_timestamps {
+            match wait_if_possible(
+                self.time_service.as_ref(),
+                Duration::from_micros(block_timestamp_us),
+                current_round_deadline,
+            )
+            .await
+            {
+                Ok(waiting_success) => {
+                    debug!("Success with {:?} for being able to vote", waiting_success);
+
+                    match waiting_success {
+                        WaitingSuccess::WaitWasRequired { wait_duration, .. } => {
+                            counters::VOTE_SUCCESS_WAIT_MS
+                                .observe(wait_duration.as_millis() as f64);
+                            counters::VOTE_WAIT_WAS_REQUIRED_COUNT.inc();
+                        }
+                        WaitingSuccess::NoWaitRequired { .. } => {
+                            counters::VOTE_SUCCESS_WAIT_MS.observe(0.0);
+                            counters::VOTE_NO_WAIT_REQUIRED_COUNT.inc();
+                        }
+                    }
+                }
+                Err(waiting_error) => {
+                    match waiting_error {
+                        WaitingError::MaxWaitExceeded => {
+                            error!(
+                                    "Waiting until proposal block timestamp usecs {:?} would exceed the round duration {:?}, hence will not vote for this round",
+                                    block_timestamp_us,
+                                    current_round_deadline);
+                            counters::VOTE_FAILURE_WAIT_MS.observe(0.0);
+                            counters::VOTE_MAX_WAIT_EXCEEDED_COUNT.inc();
+                            return;
+                        }
+                        WaitingError::WaitFailed {
+                            current_duration_since_epoch,
+                            wait_duration,
+                        } => {
+                            error!(
+                                    "Even after waiting for {:?}, proposal block timestamp usecs {:?} >= current timestamp usecs {:?}, will not vote for this round",
+                                    wait_duration,
+                                    block_timestamp_us,
+                                    current_duration_since_epoch);
+                            counters::VOTE_FAILURE_WAIT_MS
+                                .observe(wait_duration.as_millis() as f64);
+                            counters::VOTE_WAIT_FAILED_COUNT.inc();
+                            return;
+                        }
+                    };
+                }
+            }
+        }
     }
 
     /// Upon new vote:
@@ -617,49 +687,48 @@ impl<T: Payload, P: ProposerInfo> EventProcessor<T, P> {
             return;
         }
 
+        self.add_vote(vote, quorum_size).await;
+    }
+
+    /// Add a vote. Fetch missing dependencies if required.
+    /// The `duplicates_expected` field is used for cases, in which some of the votes might
+    /// be duplicated (e.g., when the votes are attached to the timeout messages).
+    /// If a QC is formed then
+    /// 1) fetch missing dependencies if required, and then
+    /// 2) pass the new QC to the pacemaker, which can generate a new round in return.
+    /// The function returns an Option for a newly generate QuorumCert in case it's been
+    /// successfully added with all its dependencies.
+    async fn add_vote(&self, vote: VoteMsg, quorum_size: usize) -> Option<Arc<QuorumCert>> {
         let deadline = self.pacemaker.current_round_deadline();
+        let preferred_peer = Some(vote.author());
+        let vote_round = vote.round();
         // TODO [Reconfiguration] Verify epoch of the vote message.
         // Add the vote and check whether it completes a new QC.
-        match self
-            .block_store
-            .insert_vote(vote.clone(), quorum_size)
-            .await
+        if let VoteReceptionResult::NewQuorumCertificate(qc) =
+            self.block_store.insert_vote(vote, quorum_size).await
         {
-            VoteReceptionResult::DuplicateVote => {
-                // This should not happen in general.
-                security_log(SecurityEvent::DuplicateConsensusVote)
-                    .error(VoteReceptionResult::DuplicateVote)
-                    .data(vote)
-                    .log();
-            }
-            VoteReceptionResult::NewQuorumCertificate(qc) => {
-                if self.block_store.need_fetch_for_quorum_cert(&qc) == NeedFetchResult::NeedFetch {
-                    if let Err(e) = self
-                        .sync_manager
-                        .fetch_quorum_cert(qc.as_ref().clone(), vote.author(), deadline)
-                        .await
-                    {
-                        error!("Error syncing to qc {}: {:?}", qc, e);
-                        return;
-                    }
-                } else {
-                    if let Err(e) = self
-                        .block_store
-                        .insert_single_quorum_cert(qc.as_ref().clone())
-                        .await
-                    {
-                        error!("Error inserting qc {}: {:?}", qc, e);
-                        return;
-                    }
+            if self.block_store.need_fetch_for_quorum_cert(&qc) == NeedFetchResult::NeedFetch {
+                if let Err(e) = self
+                    .sync_manager
+                    .fetch_quorum_cert(qc.as_ref().clone(), preferred_peer, deadline)
+                    .await
+                {
+                    error!("Error syncing to qc {}: {:?}", qc, e);
+                    return None;
                 }
-                // Notify the Pacemaker about the new QC round.
-                self.pacemaker
-                    .process_certificates(vote.round(), None)
-                    .await;
+            } else if let Err(e) = self
+                .block_store
+                .insert_single_quorum_cert(qc.as_ref().clone())
+                .await
+            {
+                error!("Error inserting qc {}: {:?}", qc, e);
+                return None;
             }
-            // nothing interesting with votes arriving for the QC that has been formed
-            _ => {}
+            // Notify the Pacemaker about the new QC round.
+            self.pacemaker.process_certificates(vote_round, None).await;
+            return Some(qc);
         };
+        None
     }
 
     /// Upon new commit:

@@ -3,8 +3,9 @@
 
 //! Test infrastructure for modeling Libra accounts.
 
-use crypto::{PrivateKey, PublicKey};
 use lazy_static::lazy_static;
+use nextgen_crypto::ed25519::*;
+use rand::{Rng, SeedableRng};
 use std::{convert::TryInto, time::Duration};
 use types::{
     access_path::AccessPath,
@@ -14,8 +15,8 @@ use types::{
     transaction::{Program, RawTransaction, SignedTransaction, TransactionArgument},
 };
 use vm_genesis::GENESIS_KEYPAIR;
-use vm_runtime::{
-    identifier::create_access_path,
+use vm_runtime::identifier::create_access_path;
+use vm_runtime_types::{
     loaded_data::struct_def::StructDef,
     value::{MutVal, Value},
 };
@@ -33,9 +34,9 @@ lazy_static! {
 pub struct Account {
     addr: AccountAddress,
     /// The current private key for this account.
-    pub privkey: PrivateKey,
+    pub privkey: Ed25519PrivateKey,
     /// The current public key for this account.
-    pub pubkey: PublicKey,
+    pub pubkey: Ed25519PublicKey,
 }
 
 impl Account {
@@ -45,8 +46,15 @@ impl Account {
     /// not automatically get added to the Libra store. To add an account to the store, use
     /// [`AccountData`] instances with
     /// [`FakeExecutor::add_account_data`][crate::executor::FakeExecutor::add_account_data].
+    /// This function returns distinct values upon every call.
     pub fn new() -> Self {
-        let (privkey, pubkey) = crypto::signing::generate_keypair();
+        let mut seed_rng = rand::rngs::OsRng::new().expect("can't access OsRng");
+        let seed_buf: [u8; 32] = seed_rng.gen();
+        let mut rng = rand::rngs::StdRng::from_seed(seed_buf);
+
+        // replace `&mut rng` by None (making the function deterministic) and watch the
+        // functional_tests fail!
+        let (privkey, pubkey) = compat::generate_keypair(&mut rng);
         Self::with_keypair(privkey, pubkey)
     }
 
@@ -54,8 +62,8 @@ impl Account {
     ///
     /// Like with [`Account::new`], the account returned by this constructor is a purely logical
     /// entity.
-    pub fn with_keypair(privkey: PrivateKey, pubkey: PublicKey) -> Self {
-        let addr = pubkey.into();
+    pub fn with_keypair(privkey: Ed25519PrivateKey, pubkey: Ed25519PublicKey) -> Self {
+        let addr = AccountAddress::from_public_key(&pubkey);
         Account {
             addr,
             privkey,
@@ -70,7 +78,7 @@ impl Account {
     pub fn new_association() -> Self {
         Account {
             addr: account_config::association_address(),
-            pubkey: GENESIS_KEYPAIR.1,
+            pubkey: GENESIS_KEYPAIR.1.clone(),
             privkey: GENESIS_KEYPAIR.0.clone(),
         }
     }
@@ -93,7 +101,7 @@ impl Account {
     }
 
     /// Changes the keys for this account to the provided ones.
-    pub fn rotate_key(&mut self, privkey: PrivateKey, pubkey: PublicKey) {
+    pub fn rotate_key(&mut self, privkey: Ed25519PrivateKey, pubkey: Ed25519PublicKey) {
         self.privkey = privkey;
         self.pubkey = pubkey;
     }
@@ -102,7 +110,7 @@ impl Account {
     ///
     /// This is the same as the account's address if the keys have never been rotated.
     pub fn auth_key(&self) -> AccountAddress {
-        AccountAddress::from(self.pubkey)
+        AccountAddress::from_public_key(&self.pubkey)
     }
 
     //
@@ -189,7 +197,7 @@ impl Account {
             gas_unit_price,
             Duration::from_secs(u64::max_value()),
         )
-        .sign(&self.privkey, self.pubkey)
+        .sign(&self.privkey, self.pubkey.clone())
         .unwrap()
         .into_inner()
     }
@@ -219,6 +227,7 @@ pub struct AccountData {
     sequence_number: u64,
     sent_events_count: u64,
     received_events_count: u64,
+    delegated_withdrawal_capability: bool,
 }
 
 impl AccountData {
@@ -231,7 +240,7 @@ impl AccountData {
 
     /// Creates a new `AccountData` with the provided account.
     pub fn with_account(account: Account, balance: u64, sequence_number: u64) -> Self {
-        Self::with_account_and_event_counts(account, balance, sequence_number, 0, 0)
+        Self::with_account_and_event_counts(account, balance, sequence_number, 0, 0, false)
     }
 
     /// Creates a new `AccountData` with custom parameters.
@@ -241,6 +250,7 @@ impl AccountData {
         sequence_number: u64,
         sent_events_count: u64,
         received_events_count: u64,
+        delegated_withdrawal_capability: bool,
     ) -> Self {
         Self {
             account,
@@ -248,11 +258,12 @@ impl AccountData {
             sequence_number,
             sent_events_count,
             received_events_count,
+            delegated_withdrawal_capability,
         }
     }
 
     /// Changes the keys for this account to the provided ones.
-    pub fn rotate_key(&mut self, privkey: PrivateKey, pubkey: PublicKey) {
+    pub fn rotate_key(&mut self, privkey: Ed25519PrivateKey, pubkey: Ed25519PublicKey) {
         self.account.rotate_key(privkey, pubkey)
     }
 
@@ -262,9 +273,10 @@ impl AccountData {
         let coin = Value::Struct(vec![MutVal::new(Value::U64(self.balance))]);
         Value::Struct(vec![
             MutVal::new(Value::ByteArray(ByteArray::new(
-                AccountAddress::from(self.account.pubkey).to_vec(),
+                AccountAddress::from_public_key(&self.account.pubkey).to_vec(),
             ))),
             MutVal::new(coin),
+            MutVal::new(Value::Bool(self.delegated_withdrawal_capability)),
             MutVal::new(Value::U64(self.received_events_count)),
             MutVal::new(Value::U64(self.sent_events_count)),
             MutVal::new(Value::U64(self.sequence_number)),
@@ -369,7 +381,7 @@ impl AccountResource {
         match account {
             Value::Struct(fields) => {
                 let received_events_count = fields
-                    .get(2)
+                    .get(3)
                     .expect("received_events_count must be field 2 in Account");
                 match &*received_events_count.peek() {
                     Value::U64(val) => *val,
@@ -385,7 +397,7 @@ impl AccountResource {
         match account {
             Value::Struct(fields) => {
                 let sent_events_count = fields
-                    .get(3)
+                    .get(4)
                     .expect("sent_events_count must be field 3 in Account");
                 match &*sent_events_count.peek() {
                     Value::U64(val) => *val,
@@ -401,7 +413,7 @@ impl AccountResource {
         match account {
             Value::Struct(fields) => {
                 let sequence_number = fields
-                    .get(4)
+                    .get(5)
                     .expect("sequence number must be the fifth field in Account");
                 match &*sequence_number.peek() {
                     Value::U64(val) => *val,

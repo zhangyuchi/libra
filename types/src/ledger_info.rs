@@ -11,15 +11,17 @@ use crate::{
 use canonical_serialization::{CanonicalSerialize, CanonicalSerializer, SimpleSerializer};
 use crypto::{
     hash::{CryptoHash, CryptoHasher, LedgerInfoHasher},
-    HashValue, Signature,
+    HashValue,
 };
 use failure::prelude::*;
 use nextgen_crypto::ed25519::*;
+#[cfg(any(test, feature = "testing"))]
 use proptest_derive::Arbitrary;
 use proto_conv::{FromProto, IntoProto};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
+    convert::TryFrom,
     fmt::{Display, Formatter},
 };
 
@@ -40,7 +42,8 @@ use std::{
 /// LedgerInfo with the `version` being the latest version that will be committed if B gets 2f+1
 /// votes. It sets `consensus_data_hash` to represent B so that if those 2f+1 votes are gathered a
 /// QC is formed on B.
-#[derive(Arbitrary, Clone, Debug, Eq, PartialEq, IntoProto, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, IntoProto, Serialize, Deserialize)]
+#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
 #[ProtoType(crate::proto::ledger_info::LedgerInfo)]
 pub struct LedgerInfo {
     /// The version of latest transaction in the ledger.
@@ -189,7 +192,7 @@ pub struct LedgerInfoWithSignatures {
     ledger_info: LedgerInfo,
     /// The validator is identified by its account address: in order to verify a signature
     /// one needs to retrieve the public key of the validator for the given epoch.
-    signatures: HashMap<AccountAddress, Signature>,
+    signatures: HashMap<AccountAddress, Ed25519Signature>,
 }
 
 impl Display for LedgerInfoWithSignatures {
@@ -199,7 +202,10 @@ impl Display for LedgerInfoWithSignatures {
 }
 
 impl LedgerInfoWithSignatures {
-    pub fn new(ledger_info: LedgerInfo, signatures: HashMap<AccountAddress, Signature>) -> Self {
+    pub fn new(
+        ledger_info: LedgerInfo,
+        signatures: HashMap<AccountAddress, Ed25519Signature>,
+    ) -> Self {
         LedgerInfoWithSignatures {
             ledger_info,
             signatures,
@@ -210,11 +216,11 @@ impl LedgerInfoWithSignatures {
         &self.ledger_info
     }
 
-    pub fn add_signature(&mut self, validator: AccountAddress, signature: Signature) {
+    pub fn add_signature(&mut self, validator: AccountAddress, signature: Ed25519Signature) {
         self.signatures.entry(validator).or_insert(signature);
     }
 
-    pub fn signatures(&self) -> &HashMap<AccountAddress, Signature> {
+    pub fn signatures(&self) -> &HashMap<AccountAddress, Ed25519Signature> {
         &self.signatures
     }
 
@@ -243,7 +249,8 @@ impl FromProto for LedgerInfoWithSignatures {
             .into_iter()
             .map(|proto| {
                 let validator_id = AccountAddress::from_proto(proto.get_validator_id().to_vec())?;
-                let signature = Signature::from_compact(proto.get_signature())?;
+                let signature_bytes: &[u8] = proto.get_signature();
+                let signature = Ed25519Signature::try_from(signature_bytes)?;
                 Ok((validator_id, signature))
             })
             .collect::<Result<HashMap<_, _>>>()?;
@@ -270,7 +277,7 @@ impl IntoProto for LedgerInfoWithSignatures {
             .for_each(|(validator_id, signature)| {
                 let mut validator_signature = crate::proto::ledger_info::ValidatorSignature::new();
                 validator_signature.set_validator_id(validator_id.into_proto());
-                validator_signature.set_signature(signature.to_compact().to_vec());
+                validator_signature.set_signature(signature.to_bytes().to_vec());
                 proto.mut_signatures().push(validator_signature)
             });
         proto

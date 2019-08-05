@@ -11,9 +11,9 @@ use structopt::StructOpt;
 
 arg_enum! {
     #[derive(Debug)]
-    pub enum Executable {
-        TestLiveness,
-        MeasureThroughput,
+    pub enum TransactionPattern {
+        Ring,
+        Pairwise,
     }
 }
 
@@ -25,8 +25,8 @@ arg_enum! {
     about = "RuBen (Ru)ns The Libra (Ben)chmarker For You."
 )]
 pub struct Opt {
-    /// Validator address list seperated by whitespace: `ip_address:port ip_address:port ...`.
-    /// It is requried unless (and hence conflict with) swarm_config_dir is present.
+    /// Validator address list separated by whitespace: `ip_address:port ip_address:port ...`.
+    /// It is required unless (and hence conflict with) swarm_config_dir is present.
     #[structopt(
         short = "a",
         long = "validator_addresses",
@@ -35,8 +35,8 @@ pub struct Opt {
         required_unless = "swarm_config_dir"
     )]
     pub validator_addresses: Vec<String>,
-    /// Debug interface address in the form of ip_address:port.
-    /// It is requried unless (and hence conflict with) swarm_config_dir is present.
+    /// TODO: Discard this option. Debug interface address in the form of ip_address:port.
+    /// It is required unless (and hence conflict with) swarm_config_dir is present.
     #[structopt(
         short = "d",
         long = "debug_address",
@@ -46,7 +46,7 @@ pub struct Opt {
     )]
     pub debug_address: Option<String>,
     /// libra_swarm's config file directory, which holds libra_node's config .toml file(s).
-    /// It is requried unless (and hence conflict with)
+    /// It is required unless (and hence conflict with)
     /// validator_addresses and debug_address are both present.
     #[structopt(
         short = "s",
@@ -76,21 +76,24 @@ pub struct Opt {
     /// A value of 1 ms effectively means starting all clients at once.
     #[structopt(short = "g", long = "stagger_range_ms", default_value = "64")]
     pub stagger_range_ms: u16,
-    /// Number of repetition to attempt, in one epoch, to increase overal number of sent TXNs.
+    /// Number of repetition to attempt, in one epoch, to increase overall number of sent TXNs.
     #[structopt(short = "r", long = "num_rounds", default_value = "1")]
     pub num_rounds: u64,
     /// Number of epochs to measure the TXN throughput, each time with newly created Benchmarker.
     #[structopt(short = "e", long = "num_epochs", default_value = "10")]
     pub num_epochs: u64,
-    /// Supported application of Benchmarker: `TestLiveness` or `MeasureThroughput`.
+    /// Submit constant number of TXN requests per second; otherwise TXNs are flood to Libra.
+    #[structopt(short = "k", long = "submit_rate")]
+    pub submit_rate: Option<u64>,
+    /// Choices of how to generate TXNs/load.
     #[structopt(
-        short = "x",
-        long = "executable",
-        raw(possible_values = "&Executable::variants()"),
+        short = "t",
+        long = "txn_pattern",
+        raw(possible_values = "&TransactionPattern::variants()"),
         case_insensitive = true,
-        default_value = "MeasureThroughput"
+        default_value = "Ring"
     )]
-    pub executable: Executable,
+    pub txn_pattern: TransactionPattern,
 }
 
 /// Helper that checks if address is valid, and converts unspecified address to localhost.
@@ -109,11 +112,9 @@ fn parse_socket_address(address: &str, port: u16) -> String {
 }
 
 /// Scan *.node.config.toml files under config_dir_name, parse them as node config
-/// and return libra_swarm's configuration info as a tuple:
-/// (addresses for all nodes, debug_address)
-fn parse_swarm_config_from_dir(config_dir_name: &str) -> Result<(Vec<String>, String)> {
+/// and return libra_swarm's node addresses info as a vector.
+fn parse_swarm_config_from_dir(config_dir_name: &str) -> Result<Vec<String>> {
     let mut validator_addresses: Vec<String> = Vec::new();
-    let mut debug_address = None;
     let re = Regex::new(r"[[:alnum:]]{64}\.node\.config\.toml").expect("failed to build regex");
     let config_dir = PathBuf::from(config_dir_name);
     if config_dir.is_dir() {
@@ -132,10 +133,6 @@ fn parse_swarm_config_from_dir(config_dir_name: &str) -> Result<(Vec<String>, St
                     let config = NodeConfig::parse(&config_string).unwrap_or_else(|_| {
                         panic!("failed to parse NodeConfig from {:?}", filename)
                     });
-                    debug_address.get_or_insert(parse_socket_address(
-                        &config.debug_interface.address,
-                        config.debug_interface.admission_control_node_debug_port,
-                    ));
                     let address = parse_socket_address(
                         &config.admission_control.address,
                         config.admission_control.admission_control_service_port,
@@ -151,11 +148,7 @@ fn parse_swarm_config_from_dir(config_dir_name: &str) -> Result<(Vec<String>, St
             config_dir_name
         )
     }
-    Ok((
-        validator_addresses,
-        debug_address
-            .ok_or_else(|| format_err!("unable to parse debug_address from {}", config_dir_name))?,
-    ))
+    Ok(validator_addresses)
 }
 
 impl Opt {
@@ -171,11 +164,14 @@ impl Opt {
     /// Override validator_addresses and debug_address if swarm_config_dir is provided.
     pub fn try_parse_validator_addresses(&mut self) {
         if let Some(swarm_config_dir) = &self.swarm_config_dir {
-            let (validator_addresses, debug_address) =
+            let validator_addresses =
                 parse_swarm_config_from_dir(swarm_config_dir).expect("invalid arguments");
             self.validator_addresses = validator_addresses;
-            self.debug_address = Some(debug_address);
         }
+    }
+
+    pub fn parse_submit_rate(&self) -> u64 {
+        self.submit_rate.unwrap_or(std::u64::MAX)
     }
 }
 

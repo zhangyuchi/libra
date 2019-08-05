@@ -124,6 +124,10 @@ where
                 ),
                 HashMap::new(),
             ),
+            ancestor_id,
+            0,
+            ancestor_id,
+            0,
         );
         let genesis_id = *GENESIS_BLOCK_ID;
         let signature = genesis_validator_signer
@@ -139,7 +143,7 @@ where
             timestamp_usecs: 0, // The beginning of UNIX TIME
             quorum_cert: genesis_quorum_cert,
             author: genesis_validator_signer.author(),
-            signature: signature.into(),
+            signature,
         }
     }
 

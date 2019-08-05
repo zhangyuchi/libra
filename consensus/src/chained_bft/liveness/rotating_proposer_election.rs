@@ -3,11 +3,11 @@
 
 use crate::chained_bft::{
     common::{Payload, Round},
-    liveness::proposer_election::{ProposalInfo, ProposerElection, ProposerInfo},
+    consensus_types::proposal_info::{ProposalInfo, ProposerInfo},
+    liveness::proposer_election::ProposerElection,
 };
 use channel;
 use futures::{Future, FutureExt, SinkExt};
-use logger::prelude::*;
 use std::pin::Pin;
 
 /// The rotating proposer maps a round to an author according to a round-robin rotation.
@@ -69,7 +69,7 @@ impl<T: Payload, P: ProposerInfo> ProposerElection<T, P> for RotatingProposer<T,
         let mut sender = self.winning_proposals_sender.clone();
         async move {
             if let Err(e) = sender.send(proposal).await {
-                debug!("Error in sending the winning proposal: {:?}", e);
+                panic!("Error in sending the winning proposal to local channel, unable to recover: {:?}", e);
             }
         }
             .boxed()

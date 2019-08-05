@@ -4,13 +4,12 @@
 use crate::{commands::*, grpc_client::GRPCClient, AccountData, AccountStatus};
 use admission_control_proto::proto::admission_control::SubmitTransactionRequest;
 use config::trusted_peers::TrustedPeersConfig;
-use crypto::signing::KeyPair;
 use failure::prelude::*;
 use futures::{future::Future, stream::Stream};
 use hyper;
 use libra_wallet::{io_utils, wallet_library::WalletLibrary};
 use logger::prelude::*;
-use nextgen_crypto::ed25519::Ed25519PublicKey;
+use nextgen_crypto::{ed25519::*, test_utils::KeyPair};
 use num_traits::{
     cast::{FromPrimitive, ToPrimitive},
     identities::Zero,
@@ -19,13 +18,13 @@ use proto_conv::IntoProto;
 use rust_decimal::Decimal;
 use serde_json;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     convert::TryFrom,
     fmt, fs,
-    io::{stdout, Write},
-    path::Path,
-    process::Command,
-    str::FromStr,
+    io::{stdout, Seek, SeekFrom, Write},
+    path::{Display, Path},
+    process::{Command, Stdio},
+    str::{self, FromStr},
     sync::Arc,
     thread, time,
 };
@@ -36,7 +35,7 @@ use types::{
     account_address::{AccountAddress, ADDRESS_LENGTH},
     account_config::{
         account_received_event_path, account_sent_event_path, association_address,
-        get_account_resource_or_default, AccountResource,
+        core_code_address, get_account_resource_or_default, AccountResource,
     },
     account_state_blob::{AccountStateBlob, AccountStateWithProof},
     contract_event::{ContractEvent, EventWithProof},
@@ -124,7 +123,7 @@ impl ClientProxy {
         // If < 4 validators, all validators have to agree.
         let validator_pubkeys: HashMap<AccountAddress, Ed25519PublicKey> = validators
             .into_iter()
-            .map(|(key, value)| (key, value.into()))
+            .map(|(key, value)| (key, value))
             .collect();
         let validator_verifier = Arc::new(ValidatorVerifier::new(validator_pubkeys));
         let client = GRPCClient::new(host, ac_port, validator_verifier)?;
@@ -135,13 +134,15 @@ impl ClientProxy {
         let faucet_account = if faucet_account_file.is_empty() {
             None
         } else {
-            let faucet_account_keypair: KeyPair =
+            let faucet_account_keypair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey> =
                 ClientProxy::load_faucet_account_file(faucet_account_file);
             let faucet_account_data = Self::get_account_data_from_address(
                 &client,
                 association_address(),
                 true,
-                Some(KeyPair::new(faucet_account_keypair.private_key().clone())),
+                Some(KeyPair::<Ed25519PrivateKey, _>::from(
+                    faucet_account_keypair.private_key,
+                )),
             )?;
             // Load the keypair from file
             Some(faucet_account_data)
@@ -220,6 +221,7 @@ impl ClientProxy {
     }
 
     /// Clone all accounts held in the client.
+    #[cfg(any(test, feature = "testing"))]
     pub fn copy_all_accounts(&self) -> Vec<AccountData> {
         self.accounts.clone()
     }
@@ -426,49 +428,53 @@ impl ClientProxy {
     pub fn compile_program(&mut self, space_delim_strings: &[&str]) -> Result<String> {
         let address = self.get_account_address_from_parameter(space_delim_strings[1])?;
         let file_path = space_delim_strings[2];
-        let is_module = if space_delim_strings.len() > 3 {
-            parse_bool(space_delim_strings[3])?
-        } else {
-            false
+        let is_module = match space_delim_strings[3] {
+            "module" => true,
+            "script" => false,
+            _ => bail!(
+                "Invalid program type: {}. Available options: module, script",
+                space_delim_strings[3]
+            ),
         };
         let output_path = {
             if space_delim_strings.len() == 5 {
                 space_delim_strings[4].to_string()
             } else {
                 let tmp_path = NamedTempFile::new()?.into_temp_path();
-                let path = tmp_path.to_str().unwrap().to_string();
+                let path = tmp_path
+                    .to_str()
+                    .ok_or_else(|| format_err!("failed to create tmp file"))?
+                    .to_string();
                 self.temp_files.push(tmp_path);
                 path
             }
         };
+        let mut tmp_source_file = NamedTempFile::new()?;
+        let mut code = fs::read_to_string(file_path)?;
+        code = code.replace("{{sender}}", &format!("0x{}", address));
+        writeln!(tmp_source_file, "{}", code)?;
+
+        let dependencies_file =
+            self.handle_dependencies(tmp_source_file.path().display(), is_module)?;
+
         // custom handler of old module format
         // TODO: eventually retire code after vm separation between modules and scripts
-        let tmp_source = if is_module {
-            let mut tmp_file = NamedTempFile::new()?;
-            let code = format!(
-                "\
-                 modules:\n\
-                 {}\n\
-                 script:\n\
-                 main(){{\n\
-                 return;\n\
-                 }}",
-                fs::read_to_string(file_path)?
-            );
-            writeln!(tmp_file, "{}", code)?;
-            Some(tmp_file)
-        } else {
-            None
-        };
+        if is_module {
+            code = format!("modules:\n{}\nscript:\nmain(){{\nreturn;\n}}", code);
+            tmp_source_file.seek(SeekFrom::Start(0))?;
+            writeln!(tmp_source_file, "{}", code)?;
+        }
 
-        let source_path = tmp_source
-            .as_ref()
-            .map(|f| f.path().to_str().unwrap())
-            .unwrap_or(file_path);
-        let args = format!(
+        let mut args = format!(
             "run -p compiler -- -a {} -o {} {}",
-            address, output_path, source_path
+            address,
+            output_path,
+            tmp_source_file.path().display(),
         );
+        if let Some(file) = &dependencies_file {
+            args.push_str(&format!(" --deps={}", file.path().display()));
+        }
+
         let status = Command::new("cargo")
             .args(args.split(' '))
             .spawn()?
@@ -477,6 +483,40 @@ impl ClientProxy {
             return Err(format_err!("compilation failed"));
         }
         Ok(output_path)
+    }
+
+    fn handle_dependencies(
+        &mut self,
+        source_path: Display,
+        is_module: bool,
+    ) -> Result<Option<NamedTempFile>> {
+        let mut args = format!("run -p compiler -- -l {}", source_path);
+        if is_module {
+            args.push_str(" -m");
+        }
+        let child = Command::new("cargo")
+            .args(args.split(' '))
+            .stdout(Stdio::piped())
+            .spawn()?;
+        let output = child.wait_with_output()?;
+        let paths: Vec<AccessPath> = serde_json::from_str(str::from_utf8(&output.stdout)?)?;
+        let mut dependencies = vec![];
+        for path in paths {
+            if path.address != core_code_address() {
+                if let (Some(blob), _) = self.client.get_account_blob(path.address)? {
+                    let map = BTreeMap::<Vec<u8>, Vec<u8>>::try_from(&blob)?;
+                    if let Some(code) = map.get(&path.path) {
+                        dependencies.push(code.clone());
+                    }
+                }
+            }
+        }
+        if dependencies.is_empty() {
+            return Ok(None);
+        }
+        let mut file = NamedTempFile::new()?;
+        file.write_all(&serde_json::to_vec(&dependencies)?)?;
+        Ok(Some(file))
     }
 
     fn submit_program(&mut self, space_delim_strings: &[&str], program: Program) -> Result<()> {
@@ -759,7 +799,7 @@ impl ClientProxy {
         client: &GRPCClient,
         address: AccountAddress,
         sync_with_validator: bool,
-        key_pair: Option<KeyPair>,
+        key_pair: Option<KeyPair<Ed25519PrivateKey, Ed25519PublicKey>>,
     ) -> Result<AccountData> {
         let (sequence_number, status) = match sync_with_validator {
             true => match client.get_account_blob(address) {
@@ -810,7 +850,9 @@ impl ClientProxy {
         self.wallet = wallet;
     }
 
-    fn load_faucet_account_file(faucet_account_file: &str) -> KeyPair {
+    fn load_faucet_account_file(
+        faucet_account_file: &str,
+    ) -> KeyPair<Ed25519PrivateKey, Ed25519PublicKey> {
         match fs::read(faucet_account_file) {
             Ok(data) => {
                 bincode::deserialize(&data[..]).expect("Unable to deserialize faucet account file")

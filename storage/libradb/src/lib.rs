@@ -10,6 +10,7 @@
 // Used in other crates for testing.
 pub mod mock_genesis;
 // Used in this and other crates for testing.
+#[cfg(any(test, feature = "testing"))]
 pub mod test_helper;
 
 pub mod errors;
@@ -19,6 +20,7 @@ mod change_set;
 mod event_store;
 mod ledger_counters;
 mod ledger_store;
+mod pruner;
 mod state_store;
 mod system_store;
 mod transaction_store;
@@ -32,6 +34,7 @@ use crate::{
     event_store::EventStore,
     ledger_counters::LedgerCounters,
     ledger_store::LedgerStore,
+    pruner::Pruner,
     schema::*,
     state_store::StateStore,
     system_store::SystemStore,
@@ -90,9 +93,13 @@ pub struct LibraDB {
     event_store: EventStore,
     #[allow(dead_code)]
     system_store: SystemStore,
+    pruner: Pruner,
 }
 
 impl LibraDB {
+    /// Config parameter for the pruner.
+    const NUM_HISTORICAL_VERSIONS_TO_KEEP: u64 = 1_000_000;
+
     /// This creates an empty LibraDB instance on disk or opens one if it already exists.
     pub fn new<P: AsRef<Path> + Clone>(db_root_path: P) -> Self {
         let cf_opts_map: ColumnFamilyOptionsMap = [
@@ -139,6 +146,7 @@ impl LibraDB {
             state_store: StateStore::new(Arc::clone(&db)),
             transaction_store: TransactionStore::new(Arc::clone(&db)),
             system_store: SystemStore::new(Arc::clone(&db)),
+            pruner: Pruner::new(Arc::clone(&db), Self::NUM_HISTORICAL_VERSIONS_TO_KEEP),
         }
     }
 
@@ -393,7 +401,7 @@ impl LibraDB {
         self.commit(sealed_cs)?;
 
         // Only increment counter if commit succeeds and there are at least one transaction written
-        // to the storage.
+        // to the storage. That's also when we'd inform the pruner thread to work.
         if num_txns > 0 {
             let last_version = first_version + num_txns - 1;
             OP_COUNTER.inc_by("committed_txns", num_txns as usize);
@@ -401,6 +409,8 @@ impl LibraDB {
             counters
                 .expect("Counters should be bumped with transactions being saved.")
                 .bump_op_counters();
+
+            self.pruner.wake(last_version);
         }
 
         Ok(())
