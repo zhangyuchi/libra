@@ -10,6 +10,8 @@
 //! chidren at the lowest level. [`LeafNode`] stores the full key and the account blob data
 //! associated.
 
+#![allow(clippy::unit_arg)]
+
 #[cfg(test)]
 mod node_type_test;
 
@@ -24,6 +26,7 @@ use crypto::{
 use failure::{Fail, Result};
 use num_derive::{FromPrimitive, ToPrimitive};
 use num_traits::cast::FromPrimitive;
+use proptest_derive::Arbitrary;
 use serde::{Deserialize, Serialize};
 use sparse_merkle::nibble_path::NibblePath;
 use std::collections::hash_map::HashMap;
@@ -34,7 +37,7 @@ use types::{
 };
 
 /// The unique key of each node.
-#[derive(Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+#[derive(Arbitrary, Clone, Debug, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct NodeKey {
     // The version at which the node is created.
     version: Version,
@@ -71,6 +74,11 @@ impl NodeKey {
         let mut node_nibble_path = self.nibble_path().clone();
         node_nibble_path.push(n);
         Self::new(version, node_nibble_path)
+    }
+
+    /// Sets the version to the given version.
+    pub fn set_version(&mut self, version: Version) {
+        self.version = version;
     }
 }
 
