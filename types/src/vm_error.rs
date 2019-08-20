@@ -101,6 +101,7 @@ pub enum VMVerificationError {
     BooleanOpTypeMismatchError(String),
     EqualityOpTypeMismatchError(String),
     ExistsResourceTypeMismatchError(String),
+    ExistsNoResourceError(String),
     BorrowGlobalTypeMismatchError(String),
     BorrowGlobalNoResourceError(String),
     MoveFromTypeMismatchError(String),
@@ -108,6 +109,7 @@ pub enum VMVerificationError {
     MoveToSenderTypeMismatchError(String),
     MoveToSenderNoResourceError(String),
     CreateAccountTypeMismatchError(String),
+    GlobalReferenceError(String),
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
@@ -135,6 +137,7 @@ pub enum VMInvariantViolationError {
     LocalReferenceError,
     StorageError,
     InternalTypeError,
+    EventKeyMismatch,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
@@ -542,6 +545,9 @@ impl IntoProto for VMVerificationError {
             VMVerificationError::ExistsResourceTypeMismatchError(message) => {
                 (ProtoKind::ExistsResourceTypeMismatchError, message)
             }
+            VMVerificationError::ExistsNoResourceError(message) => {
+                (ProtoKind::ExistsNoResourceError, message)
+            }
             VMVerificationError::BorrowGlobalTypeMismatchError(message) => {
                 (ProtoKind::BorrowGlobalTypeMismatchError, message)
             }
@@ -562,6 +568,9 @@ impl IntoProto for VMVerificationError {
             }
             VMVerificationError::CreateAccountTypeMismatchError(message) => {
                 (ProtoKind::CreateAccountTypeMismatchError, message)
+            }
+            VMVerificationError::GlobalReferenceError(message) => {
+                (ProtoKind::GlobalReferenceError, message)
             }
         }
     }
@@ -722,6 +731,9 @@ impl FromProto for VMVerificationError {
             ProtoKind::ExistsResourceTypeMismatchError => Ok(
                 VMVerificationError::ExistsResourceTypeMismatchError(message),
             ),
+            ProtoKind::ExistsNoResourceError => {
+                Ok(VMVerificationError::ExistsNoResourceError(message))
+            }
             ProtoKind::BorrowGlobalTypeMismatchError => {
                 Ok(VMVerificationError::BorrowGlobalTypeMismatchError(message))
             }
@@ -742,6 +754,9 @@ impl FromProto for VMVerificationError {
             }
             ProtoKind::CreateAccountTypeMismatchError => {
                 Ok(VMVerificationError::CreateAccountTypeMismatchError(message))
+            }
+            ProtoKind::GlobalReferenceError => {
+                Ok(VMVerificationError::GlobalReferenceError(message))
             }
             ProtoKind::UnknownVerificationError => {
                 bail_err!(DecodingError::UnknownVerificationErrorEncountered)
@@ -823,6 +838,7 @@ impl IntoProto for VMInvariantViolationError {
             VMInvariantViolationError::LocalReferenceError => ProtoStatus::LocalReferenceError,
             VMInvariantViolationError::StorageError => ProtoStatus::StorageError,
             VMInvariantViolationError::InternalTypeError => ProtoStatus::InternalTypeError,
+            VMInvariantViolationError::EventKeyMismatch => ProtoStatus::EventKeyMismatch,
         }
     }
 }
@@ -842,6 +858,7 @@ impl FromProto for VMInvariantViolationError {
             ProtoError::LocalReferenceError => Ok(VMInvariantViolationError::LocalReferenceError),
             ProtoError::StorageError => Ok(VMInvariantViolationError::StorageError),
             ProtoError::InternalTypeError => Ok(VMInvariantViolationError::InternalTypeError),
+            ProtoError::EventKeyMismatch => Ok(VMInvariantViolationError::EventKeyMismatch),
             ProtoError::UnknownInvariantViolationError => {
                 bail_err!(DecodingError::UnknownInvariantViolationErrorEncountered)
             }

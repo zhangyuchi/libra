@@ -279,6 +279,9 @@ pub enum VMStaticViolation {
     #[fail(display = "Unable to verify Exists at offset {}", _0)]
     ExistsResourceTypeMismatchError(usize),
 
+    #[fail(display = "Unable to verify Exists at offset {}", _0)]
+    ExistsNoResourceError(usize),
+
     #[fail(display = "Unable to verify BorrowGlobal at offset {}", _0)]
     BorrowGlobalTypeMismatchError(usize),
 
@@ -299,6 +302,9 @@ pub enum VMStaticViolation {
 
     #[fail(display = "Unable to verify MoveToSender at offset {}", _0)]
     CreateAccountTypeMismatchError(usize),
+
+    #[fail(display = "Illegal global operation at offset {}", _0)]
+    GlobalReferenceError(usize),
 }
 
 #[derive(Clone, Debug, Eq, Fail, Ord, PartialEq, PartialOrd)]
@@ -327,6 +333,8 @@ pub enum VMInvariantViolation {
     StorageError,
     #[fail(display = "Internal runtime type error due to incorrect bytecode verification")]
     InternalTypeError,
+    #[fail(display = "Event key is not 32 byte")]
+    EventKeyMismatch,
 }
 
 /// Error codes that can be emitted by the prologue. These have special significance to the VM when
@@ -508,6 +516,7 @@ impl From<&VMInvariantViolation> for VMStatus {
             }
             VMInvariantViolation::StorageError => VMInvariantViolationError::StorageError,
             VMInvariantViolation::InternalTypeError => VMInvariantViolationError::InternalTypeError,
+            VMInvariantViolation::EventKeyMismatch => VMInvariantViolationError::EventKeyMismatch,
         };
         VMStatus::InvariantViolation(err)
     }
@@ -686,6 +695,9 @@ impl From<&VerificationError> for VMVerificationError {
             VMStaticViolation::ExistsResourceTypeMismatchError(_) => {
                 VMVerificationError::ExistsResourceTypeMismatchError(message)
             }
+            VMStaticViolation::ExistsNoResourceError(_) => {
+                VMVerificationError::ExistsNoResourceError(message)
+            }
             VMStaticViolation::BorrowGlobalTypeMismatchError(_) => {
                 VMVerificationError::BorrowGlobalTypeMismatchError(message)
             }
@@ -706,6 +718,9 @@ impl From<&VerificationError> for VMVerificationError {
             }
             VMStaticViolation::CreateAccountTypeMismatchError(_) => {
                 VMVerificationError::CreateAccountTypeMismatchError(message)
+            }
+            VMStaticViolation::GlobalReferenceError(_) => {
+                VMVerificationError::GlobalReferenceError(message)
             }
         }
     }

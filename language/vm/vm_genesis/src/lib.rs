@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use config::config::{VMConfig, VMPublishingOption};
-use crypto::{PrivateKey, PublicKey};
 use failure::prelude::*;
 use ir_to_bytecode::{compiler::compile_program, parser::ast};
 use lazy_static::lazy_static;
@@ -46,7 +45,7 @@ const GENESIS_SEED: [u8; 32] = [42; 32];
 
 lazy_static! {
     pub static ref GENESIS_KEYPAIR: (Ed25519PrivateKey, Ed25519PublicKey) = {
-        let mut rng = ::rand::rngs::StdRng::from_seed(GENESIS_SEED);
+        let mut rng = StdRng::from_seed(GENESIS_SEED);
         compat::generate_keypair(&mut rng)
     };
 }
@@ -56,17 +55,18 @@ pub fn sign_genesis_transaction(raw_txn: RawTransaction) -> Result<SignatureChec
     raw_txn.sign(private_key, public_key.clone())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
+#[cfg_attr(any(test, feature = "testing"), derive(Clone))]
 pub struct Account {
     pub addr: AccountAddress,
-    pub privkey: PrivateKey,
-    pub pubkey: PublicKey,
+    pub privkey: Ed25519PrivateKey,
+    pub pubkey: Ed25519PublicKey,
 }
 
 impl Account {
     pub fn new(rng: &mut StdRng) -> Self {
-        let (privkey, pubkey) = crypto::signing::generate_keypair_for_testing(rng);
-        let addr = pubkey.into();
+        let (privkey, pubkey) = compat::generate_keypair(&mut *rng);
+        let addr = AccountAddress::from_public_key(&pubkey);
         Account {
             addr,
             privkey,
@@ -117,12 +117,12 @@ impl Accounts {
         self.accounts[account].addr
     }
 
-    pub fn get_account(&self, account: usize) -> Account {
-        self.accounts[account].clone()
+    pub fn get_account(&self, account: usize) -> &Account {
+        &self.accounts[account]
     }
 
-    pub fn get_public_key(&self, account: usize) -> PublicKey {
-        self.accounts[account].pubkey
+    pub fn get_public_key(&self, account: usize) -> Ed25519PublicKey {
+        self.accounts[account].pubkey.clone()
     }
 
     pub fn create_txn_with_args(
@@ -327,6 +327,10 @@ pub fn encode_genesis_transaction_with_validator(
 
             let mut txn_executor = TransactionExecutor::new(&block_cache, &data_cache, txn_data);
             txn_executor.create_account(genesis_addr).unwrap().unwrap();
+            txn_executor
+                .create_account(account_config::core_code_address())
+                .unwrap()
+                .unwrap();
             txn_executor
                 .execute_function(&COIN_MODULE, "initialize", vec![])
                 .unwrap()

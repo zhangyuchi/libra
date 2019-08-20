@@ -73,7 +73,7 @@ use crate::{
     node_type::{Node, NodeKey},
     StaleNodeIndex, TreeReader, TreeUpdateBatch,
 };
-use crypto::{hash::SPARSE_MERKLE_PLACEHOLDER_HASH, HashValue};
+use crypto::HashValue;
 use failure::prelude::*;
 use std::{
     collections::{hash_map::Entry, HashMap, HashSet},
@@ -90,8 +90,14 @@ struct FrozenTreeCache {
     /// Immutable node_cache.
     node_cache: HashMap<NodeKey, Node>,
 
+    /// # of leaves in the `node_cache`,
+    num_new_leaves: usize,
+
     /// Immutable stale_node_index_cache.
     stale_node_index_cache: HashSet<StaleNodeIndex>,
+
+    /// # of leaves in the `stale_node_index_cache`,
+    num_stale_leaves: usize,
 
     /// Frozen root hashes after each earlier transaction.
     root_hashes: Vec<HashValue>,
@@ -101,7 +107,7 @@ struct FrozenTreeCache {
 /// blobs.
 pub struct TreeCache<'a, R: 'a + TreeReader> {
     /// `NodeKey` of the current root node in cache.
-    root_node_key: Option<NodeKey>,
+    root_node_key: NodeKey,
 
     /// The version of the transaction to which the upcoming `put`s will be related.
     next_version: Version,
@@ -109,8 +115,14 @@ pub struct TreeCache<'a, R: 'a + TreeReader> {
     /// Intermediate nodes keyed by node hash
     node_cache: HashMap<NodeKey, Node>,
 
-    /// Partial retire log. `NodeKey` to identify the retired record.
+    /// # of leaves in the `node_cache`,
+    num_new_leaves: usize,
+
+    /// Partial stale log. `NodeKey` to identify the stale record.
     stale_node_index_cache: HashSet<NodeKey>,
+
+    /// # of leaves in the `stale_node_index_cache`,
+    num_stale_leaves: usize,
 
     /// The immutable part of this cache, which will be committed to the underlying storage.
     frozen_cache: FrozenTreeCache,
@@ -141,58 +153,73 @@ where
 {
     /// Constructs a new `TreeCache` instance.
     pub fn new(reader: &'a R, next_version: Version) -> Self {
+        let mut node_cache = HashMap::new();
+        let root_node_key = if next_version == 0 {
+            // If the first version is 0, it means we need to start from an empty tree so we insert
+            // a null node beforehand deliberately to deal with this corner case.
+            node_cache.insert(NodeKey::new_empty_path(0), Node::new_null());
+            NodeKey::new_empty_path(0)
+        } else {
+            NodeKey::new_empty_path(next_version - 1)
+        };
         Self {
-            node_cache: HashMap::default(),
-            stale_node_index_cache: HashSet::default(),
+            node_cache,
+            stale_node_index_cache: HashSet::new(),
             frozen_cache: FrozenTreeCache::default(),
-            root_node_key: if next_version == 0 {
-                None
-            } else {
-                Some(NodeKey::new_empty_path(next_version - 1))
-            },
+            root_node_key,
             next_version,
             reader,
+            num_stale_leaves: 0,
+            num_new_leaves: 0,
         }
     }
 
     /// Gets the current root node key.
-    pub fn get_root_node_key(&self) -> &Option<NodeKey> {
+    pub fn get_root_node_key(&self) -> &NodeKey {
         &self.root_node_key
     }
 
     /// Set roots `node_key`.
-    pub fn set_root_node_key(&mut self, root_node_key: Option<NodeKey>) {
+    pub fn set_root_node_key(&mut self, root_node_key: NodeKey) {
         self.root_node_key = root_node_key;
     }
 
     /// Puts the node with given hash as key into node_cache.
     pub fn put_node(&mut self, node_key: NodeKey, new_node: Node) -> Result<()> {
         match self.node_cache.entry(node_key) {
-            Entry::Vacant(o) => o.insert(new_node),
+            Entry::Vacant(o) => {
+                if new_node.is_leaf() {
+                    self.num_new_leaves += 1
+                }
+                o.insert(new_node);
+            }
             Entry::Occupied(o) => bail!("Node with key {:?} already exists in NodeBatch", o.key()),
         };
         Ok(())
     }
 
     /// Deletes a node with given hash.
-    pub fn delete_node(&mut self, old_node_key: &NodeKey) {
+    pub fn delete_node(&mut self, old_node_key: &NodeKey, is_leaf: bool) {
         // If node cache doesn't have this node, it means the node is in the previous version of
         // the tree on the disk.
         if self.node_cache.remove(&old_node_key).is_none() {
             let is_new_entry = self.stale_node_index_cache.insert(old_node_key.clone());
-            assert!(is_new_entry, "Node retired twice unexpectedly.");
+            assert!(is_new_entry, "Node gets stale twice unexpectedly.");
+            if is_leaf {
+                self.num_stale_leaves += 1;
+            }
+        } else if is_leaf {
+            self.num_new_leaves -= 1;
         }
     }
 
     /// Freezes all the contents in cache to be immutable and clear `node_cache`.
     pub fn freeze(&mut self) {
-        let root_hash = match self.get_root_node_key() {
-            Some(node_key) => self
-                .get_node(node_key)
-                .unwrap_or_else(|_| panic!("Root node with key {:?} must exist", node_key))
-                .hash(),
-            None => *SPARSE_MERKLE_PLACEHOLDER_HASH,
-        };
+        let root_node_key = self.get_root_node_key();
+        let root_hash = self
+            .get_node(root_node_key)
+            .unwrap_or_else(|_| panic!("Root node with key {:?} must exist", root_node_key))
+            .hash();
         self.frozen_cache.root_hashes.push(root_hash);
         self.frozen_cache.node_cache.extend(self.node_cache.drain());
 
@@ -207,6 +234,11 @@ where
                         node_key,
                     }),
             );
+        self.frozen_cache.num_stale_leaves += self.num_stale_leaves;
+        self.num_stale_leaves = 0;
+        self.frozen_cache.num_new_leaves += self.num_new_leaves;
+        self.num_new_leaves = 0;
+
         self.next_version += 1;
     }
 }
@@ -221,6 +253,8 @@ where
             TreeUpdateBatch {
                 node_batch: self.frozen_cache.node_cache,
                 stale_node_index_batch: self.frozen_cache.stale_node_index_cache,
+                num_new_leaves: self.frozen_cache.num_new_leaves,
+                num_stale_leaves: self.frozen_cache.num_stale_leaves,
             },
         )
     }

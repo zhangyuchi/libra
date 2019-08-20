@@ -5,8 +5,8 @@ use crate::{
     output_tee::{OutputTee, OutputTeeGuard},
     utils,
 };
-use config::config::NodeConfig;
-use config_builder::swarm_config::{SwarmConfig, SwarmConfigBuilder};
+use config::config::{NodeConfig, RoleType};
+use config_builder::swarm_config::{LibraSwarmTopology, SwarmConfig, SwarmConfigBuilder};
 use debug_interface::NodeDebugClient;
 use failure::prelude::*;
 use logger::prelude::*;
@@ -64,7 +64,7 @@ impl LibraNode {
         tee_logs: bool,
     ) -> Result<Self> {
         let peer_id = config.base.peer_id.clone();
-        let log = logdir.join(format!("{}.log", peer_id));
+        let log = logdir.join(format!("{}.log", SwarmConfig::get_alias(&config)));
         let log_file = File::create(&log)?;
         let mut node_command = Command::new(utils::get_bin(LIBRA_NODE_BIN));
         node_command
@@ -230,7 +230,8 @@ pub struct LibraSwarm {
     // Output log, LibraNodes' config file, libradb etc, into this dir.
     pub dir: Option<LibraSwarmDir>,
     // Maps the peer id of a node to the LibraNode struct
-    pub nodes: HashMap<String, LibraNode>,
+    pub validator_nodes: HashMap<String, LibraNode>,
+    pub full_nodes: Vec<LibraNode>,
     pub config: SwarmConfig,
     tee_logs: bool,
 }
@@ -250,7 +251,7 @@ pub enum SwarmLaunchFailure {
 
 impl LibraSwarm {
     pub fn launch_swarm(
-        num_nodes: usize,
+        topology: LibraSwarmTopology,
         disable_logging: bool,
         faucet_account_keypair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey>,
         tee_logs: bool,
@@ -259,13 +260,14 @@ impl LibraSwarm {
     ) -> Self {
         let num_launch_attempts = 5;
         for i in 0..num_launch_attempts {
+            let swarm_config_dir = Self::setup_config_dir(&config_dir);
             info!("Launch swarm attempt: {} of {}", i, num_launch_attempts);
             match Self::launch_swarm_attempt(
-                num_nodes,
+                topology.clone(),
                 disable_logging,
                 faucet_account_keypair.clone(),
                 tee_logs,
-                &config_dir,
+                swarm_config_dir,
                 &template_path,
             ) {
                 Ok(swarm) => {
@@ -277,27 +279,37 @@ impl LibraSwarm {
         panic!("Max out {} attempts to launch swarm", num_launch_attempts);
     }
 
-    fn launch_swarm_attempt(
-        num_nodes: usize,
-        disable_logging: bool,
-        faucet_account_keypair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey>,
-        tee_logs: bool,
-        config_dir: &Option<String>,
-        template_path: &Option<String>,
-    ) -> std::result::Result<Self, SwarmLaunchFailure> {
+    /// Either create a persistent directory for swarm or return a temporary one.
+    /// If specified persistent directory already exists,
+    /// assumably due to previous launch failure, it will be removed.
+    /// The directory for the last failed attempt won't be removed.
+    fn setup_config_dir(config_dir: &Option<String>) -> LibraSwarmDir {
         let dir = match config_dir {
             Some(dir_str) => {
+                let path_buf = PathBuf::from_str(&dir_str).expect("unable to create config dir");
+                if path_buf.exists() {
+                    std::fs::remove_dir_all(dir_str).expect("unable to delete previous config dir");
+                }
                 std::fs::create_dir_all(dir_str).expect("unable to create config dir");
-                LibraSwarmDir::Persistent(
-                    PathBuf::from_str(&dir_str).expect("unable to create config dir"),
-                )
+                LibraSwarmDir::Persistent(path_buf)
             }
             None => LibraSwarmDir::Temporary(
                 tempfile::tempdir().expect("unable to create temporary config dir"),
             ),
         };
-        let logs_dir_path = &dir.as_ref().join("logs");
         println!("Base directory containing logs and configs: {:?}", &dir);
+        dir
+    }
+
+    fn launch_swarm_attempt(
+        topology: LibraSwarmTopology,
+        disable_logging: bool,
+        faucet_account_keypair: KeyPair<Ed25519PrivateKey, Ed25519PublicKey>,
+        tee_logs: bool,
+        dir: LibraSwarmDir,
+        template_path: &Option<String>,
+    ) -> std::result::Result<Self, SwarmLaunchFailure> {
+        let logs_dir_path = dir.as_ref().join("logs");
         std::fs::create_dir(&logs_dir_path).unwrap();
         let base = utils::workspace_root().join(
             template_path
@@ -305,18 +317,19 @@ impl LibraSwarm {
                 .unwrap_or(&"config/data/configs/node.config.toml".to_string()),
         );
         let mut config_builder = SwarmConfigBuilder::new();
+
         config_builder
             .with_ipv4()
-            .with_nodes(num_nodes)
+            .with_topology(topology)
             .with_base(base)
             .with_output_dir(&dir)
-            .with_faucet_keypair(faucet_account_keypair)
-            .randomize_ports();
+            .with_faucet_keypair(faucet_account_keypair);
         let config = config_builder.build().unwrap();
 
         let mut swarm = Self {
             dir: Some(dir),
-            nodes: HashMap::new(),
+            validator_nodes: HashMap::new(),
+            full_nodes: vec![],
             config,
             tee_logs,
         };
@@ -330,7 +343,14 @@ impl LibraSwarm {
                 tee_logs,
             )
             .unwrap();
-            swarm.nodes.insert(node.peer_id(), node);
+            match node_config.base.get_role() {
+                RoleType::Validator => {
+                    swarm.validator_nodes.insert(node.peer_id(), node);
+                }
+                RoleType::FullNode => {
+                    swarm.full_nodes.push(node);
+                }
+            }
         }
 
         swarm.wait_for_startup()?;
@@ -343,7 +363,7 @@ impl LibraSwarm {
 
     fn wait_for_connectivity(&self) -> std::result::Result<(), SwarmLaunchFailure> {
         // Early return if we're only launching a single node
-        if self.nodes.len() == 1 {
+        if self.validator_nodes.len() == 1 {
             return Ok(());
         }
 
@@ -353,12 +373,13 @@ impl LibraSwarm {
             debug!("Wait for connectivity attempt: {}", i);
 
             if self
-                .nodes
+                .validator_nodes
                 .values()
-                .all(|node| node.check_connectivity(self.nodes.len() as i64 - 1))
+                .all(|node| node.check_connectivity(self.validator_nodes.len() as i64 - 1))
             {
                 return Ok(());
             }
+            // TODO check full node connectivity for full nodes
 
             ::std::thread::sleep(::std::time::Duration::from_millis(1000));
         }
@@ -368,11 +389,15 @@ impl LibraSwarm {
 
     fn wait_for_startup(&mut self) -> std::result::Result<(), SwarmLaunchFailure> {
         let num_attempts = 120;
-        let mut done = vec![false; self.nodes.len()];
-
+        let mut done = vec![false; self.validator_nodes.len() + self.full_nodes.len()];
         for i in 0..num_attempts {
             debug!("Wait for startup attempt: {} of {}", i, num_attempts);
-            for (node, done) in self.nodes.values_mut().zip(done.iter_mut()) {
+            for (node, done) in self
+                .validator_nodes
+                .values_mut()
+                .chain(self.full_nodes.iter_mut())
+                .zip(done.iter_mut())
+            {
                 if *done {
                     continue;
                 }
@@ -410,12 +435,12 @@ impl LibraSwarm {
     pub fn wait_for_all_nodes_to_catchup(&mut self) -> bool {
         let num_attempts = 60;
         let last_committed_round_str = "consensus{op=committed_blocks_count}";
-        let mut done = vec![false; self.nodes.len()];
+        let mut done = vec![false; self.validator_nodes.len()];
 
         let mut last_committed_round = 0;
         // First, try to retrieve the max value across all the committed rounds
         debug!("Calculating max committed round across the validators.");
-        for node in self.nodes.values() {
+        for node in self.validator_nodes.values() {
             match node.get_metric(last_committed_round_str) {
                 Some(val) => {
                     debug!("\tNode {} last committed round = {}", node.peer_id, val);
@@ -436,7 +461,7 @@ impl LibraSwarm {
                 "Wait for catchup, target_commit_round = {}, attempt: {} of {}",
                 last_committed_round, i, num_attempts
             );
-            for (node, done) in self.nodes.values_mut().zip(done.iter_mut()) {
+            for (node, done) in self.validator_nodes.values_mut().zip(done.iter_mut()) {
                 if *done {
                     continue;
                 }
@@ -476,14 +501,29 @@ impl LibraSwarm {
         false
     }
 
-    /// Vector with the public AC ports of the validators.
-    pub fn get_validators_public_ports(&self) -> Vec<u16> {
-        self.nodes.values().map(|node| node.ac_port()).collect()
+    /// A specific public AC port of a validator or a full node.
+    pub fn get_ac_port(&self, index: usize, role: RoleType) -> u16 {
+        match role {
+            RoleType::Validator => *self
+                .validator_nodes
+                .values()
+                .map(|node| node.ac_port())
+                .collect::<Vec<u16>>()
+                .get(index)
+                .unwrap(),
+            RoleType::FullNode => *self
+                .full_nodes
+                .iter()
+                .map(|node| node.ac_port())
+                .collect::<Vec<u16>>()
+                .get(index)
+                .unwrap(),
+        }
     }
 
     /// Vector with the peer ids of the validators in the swarm.
     pub fn get_validators_ids(&self) -> Vec<String> {
-        self.nodes.keys().cloned().collect()
+        self.validator_nodes.keys().cloned().collect()
     }
 
     /// Vector with the debug ports of all the validators in the swarm.
@@ -496,11 +536,11 @@ impl LibraSwarm {
     }
 
     pub fn get_validator(&self, peer_id: &str) -> Option<&LibraNode> {
-        self.nodes.get(peer_id)
+        self.validator_nodes.get(peer_id)
     }
 
     pub fn kill_node(&mut self, peer_id: &str) {
-        self.nodes.remove(peer_id);
+        self.validator_nodes.remove(peer_id);
     }
 
     pub fn add_node(
@@ -535,7 +575,7 @@ impl LibraSwarm {
                 .unwrap();
         for _ in 0..60 {
             if let HealthStatus::Healthy = node.health_check() {
-                self.nodes.insert(peer_id, node);
+                self.validator_nodes.insert(peer_id, node);
                 return self.wait_for_connectivity();
             }
             ::std::thread::sleep(::std::time::Duration::from_millis(1000));

@@ -232,10 +232,15 @@ pub struct StructHandle {
     pub module: ModuleHandleIndex,
     /// The name of the type.
     pub name: StringPoolIndex,
-    /// The kind of the struct itself.
-    pub kind: Kind,
-    /// The kind constraints of the type parameters.
-    pub kind_constraints: Vec<Kind>,
+    /// There are two ways for a type to have the Kind resource
+    /// 1) If it has a type argument of resource
+    /// 2) If it was declared as a resource
+    /// These "declared" resources are referred to as *nominal resources*
+    ///
+    /// If `is_nominal_resource` is true, it is a *nominal resource*
+    pub is_nominal_resource: bool,
+    /// The type parameters (identified by their index into the vec) and their kind constraints
+    pub type_parameters: Vec<Kind>,
 }
 
 /// A `FunctionHandle` is a reference to a function. It is composed by a
@@ -323,6 +328,16 @@ pub struct FunctionDefinition {
     pub function: FunctionHandleIndex,
     /// Flags for this function (private, public, native, etc.)
     pub flags: u8,
+    /// List of nominal resources (declared in this module) that the procedure might access
+    /// Either through: BorrowGlobal, MoveFrom, or transitively through another procedure
+    /// This list of acquires grants the borrow checker the ability to statically verify the safety
+    /// of references into global storage
+    ///
+    /// Not in the signature as it is not needed outside of the declaring module
+    ///
+    /// Note, there is no LocalsSignatureIndex with each struct definition index, as global
+    /// resources cannot currently take type arguments
+    pub acquires_global_resources: Vec<StructDefinitionIndex>,
     /// Code for this function.
     #[cfg_attr(
         any(test, feature = "testing"),
@@ -342,7 +357,7 @@ impl FunctionDefinition {
     }
 }
 
-// Signature definitions.
+// Signature
 // A signature can be for a type (field, local) or for a function - return type: (arguments).
 // They both go into the signature table so there is a marker that tags the signature.
 // Signature usually don't carry a size and you have to read them to get to the end.
@@ -375,8 +390,8 @@ pub struct FunctionSignature {
         proptest(strategy = "vec(any::<SignatureToken>(), 0..=params)")
     )]
     pub arg_types: Vec<SignatureToken>,
-    /// The kind constraints of the type parameters.
-    pub kind_constraints: Vec<Kind>,
+    /// The type parameters (identified by their index into the vec) and their kind constraints
+    pub type_parameters: Vec<Kind>,
 }
 
 /// A `LocalsSignature` is the list of locals used by a function.
@@ -412,29 +427,25 @@ impl LocalsSignature {
 /// type parameter in the `FunctionSignature/Handle` and `StructHandle`.
 pub type TypeParameterIndex = u16;
 
-/// A `Kind` is the type of a type. It classifies types into categories with rules each category
-/// must follow.
+/// A `Kind` classifies types into sets with rules each set must follow.
 ///
-/// Currently there are two kinds in Move: `resource` and `copyable`.
+/// Currently there are three kinds in Move: `All`, `Resource` and `Unrestricted`.
 #[derive(Debug, Clone, Eq, Copy, Hash, Ord, PartialEq, PartialOrd)]
 #[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
 pub enum Kind {
-    /// `resource` types must follow move semantics and various resource safety rules.
+    /// Represents the super set of all types. The type might actually be a `Resource` or
+    /// `Unrestricted` A type might be in this set if it is not known to be a `Resource` or
+    /// `Unrestricted`
+    ///   - This occurs when there is a type parameter with this kind as a constraint
+    All,
+    /// `Resource` types must follow move semantics and various resource safety rules, namely:
+    /// - `Resource` values cannot be copied
+    /// - `Resource` values cannot be popped, i.e. they must be used
     Resource,
-    /// `copyable` types do not need to follow the said rules. Most notably they can be freely
-    /// copied & destroyed. A `copyable` can still be used as a `resource` and therefore it is
-    /// considered a sub-kind of the latter.
-    Copyable,
-}
-
-impl Kind {
-    /// Checks if the kind is resource.
-    pub fn is_resource(self) -> bool {
-        match self {
-            Kind::Resource => true,
-            Kind::Copyable => false,
-        }
-    }
+    /// `Unrestricted` types do not need to follow the `Resource` rules.
+    /// - `Unrestricted` values can be copied
+    /// - `Unrestricted` values can be popped
+    Unrestricted,
 }
 
 /// A `SignatureToken` is a type declaration for a location.
@@ -538,9 +549,9 @@ impl SignatureToken {
         }
     }
 
-    /// Returns the "kind" for the `SignatureToken`
+    /// Returns the "value kind" for the `SignatureToken`
     #[inline]
-    pub fn kind(&self) -> SignatureTokenKind {
+    pub fn signature_token_kind(&self) -> SignatureTokenKind {
         // TODO: SignatureTokenKind is out-dated. fix/update/remove SignatureTokenKind and see if
         // this function needs to be cleaned up
         use SignatureToken::*;
@@ -1022,13 +1033,6 @@ pub enum Bytecode {
     ///
     /// ```..., address_value -> ...```
     CreateAccount,
-    /// Emit a log message.
-    /// This bytecode is not fully specified yet.
-    ///
-    /// Stack transition:
-    ///
-    /// ```..., reference, key, value -> ...```
-    EmitEvent,
     /// Get the sequence number submitted with the transaction and pushes it on the stack.
     ///
     /// Stack transition:
@@ -1046,7 +1050,7 @@ pub enum Bytecode {
 /// The number of bytecode instructions.
 /// This is necessary for checking that all instructions are covered since Rust
 /// does not provide a way of determining the number of variants of an enum.
-pub const NUMBER_OF_BYTECODE_INSTRUCTIONS: usize = 53;
+pub const NUMBER_OF_BYTECODE_INSTRUCTIONS: usize = 52;
 
 impl ::std::fmt::Debug for Bytecode {
     fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
@@ -1101,7 +1105,6 @@ impl ::std::fmt::Debug for Bytecode {
             Bytecode::MoveFrom(a, b) => write!(f, "MoveFrom({}, {:?})", a, b),
             Bytecode::MoveToSender(a, b) => write!(f, "MoveToSender({}, {:?})", a, b),
             Bytecode::CreateAccount => write!(f, "CreateAccount"),
-            Bytecode::EmitEvent => write!(f, "EmitEvent"),
             Bytecode::GetTxnSequenceNumber => write!(f, "GetTxnSequenceNumber"),
             Bytecode::GetTxnPublicKey => write!(f, "GetTxnPublicKey"),
         }
@@ -1552,7 +1555,7 @@ pub fn dummy_procedure_module(code: Vec<Bytecode>) -> CompiledModule {
     module.function_signatures.push(FunctionSignature {
         arg_types: vec![],
         return_types: vec![],
-        kind_constraints: vec![],
+        type_parameters: vec![],
     });
     let fun_handle = FunctionHandle {
         module: ModuleHandleIndex(0),

@@ -1,23 +1,82 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+//! This module implements [`JellyfishMerkleTree`] backed by storage module. The tree itself doesn't
+//! persist anything, but realizes the logic of R/W only. The write path will produce all the
+//! intermediate results in a batch for storage layer to commit and the read path will return
+//! results directly. The public APIs are only [`new`](JellyfishMerkleTree::new),
+//! [`put_blob_sets`](JellyfishMerkleTree::put_blob_sets),
+//! [`put_blob_set`](JellyfishMerkleTree::put_blob_set) and
+//! [`get_with_proof`](JellyfishMerkleTree::get_with_proof). After each put with a `blob_set`
+//! based on a known version, the tree will return a new root hash with a [`TreeUpdateBatch`]
+//! containing all the new nodes and indices of stale nodes.
+//!
+//! A Jellyfish Merkle Tree itself logically is a 256-bit sparse Merkle tree with an optimization
+//! that any subtree containing 0 or 1 leaf node will be replaced by that leaf node or a placeholder
+//! node with default hash value. With this optimization we can save CPU by avoiding hashing on
+//! many sparse levels in the tree. Physically, the tree is structurally similar to the modified
+//! Patricia Merkle tree of Ethereum but with some modifications. A standard Jellyfish Merkle tree
+//! will look like the following figure:
+//!                                    .──────────────────────.
+//!                            _.─────'                        `──────.
+//!                       _.──'                                        `───.
+//!                   _.─'                                                  `──.
+//!               _.─'                                                          `──.
+//!             ,'                                                                  `.
+//!          ,─'                                                                      '─.
+//!        ,'                                                                            `.
+//!      ,'                                                                                `.
+//!     ╱                                                                                    ╲
+//!    ╱                                                                                      ╲
+//!   ╱                                                                                        ╲
+//!  ╱                                                                                          ╲
+//! ;                                                                                            :
+//! ;                                                                                            :
+//!;                                                                                              :
+//!│                                                                                              │
+//!+──────────────────────────────────────────────────────────────────────────────────────────────+
+//! .''.  .''.  .''.  .''.  .''.  .''.  .''.  .''.  .''.  .''.  .''.  .''.  .''.  .''.  .''.  .''.
+//!/    \/    \/    \/    \/    \/    \/    \/    \/    \/    \/    \/    \/    \/    \/    \/    \
+//!+----++----++----++----++----++----++----++----++----++----++----++----++----++----++----++----+
+//! (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (
+//!  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )
+//! (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (
+//!  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )
+//! (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (
+//!  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )
+//! (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (
+//!  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )  )
+//! (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (  (
+//! ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■  ■
+//! ■: account_state_blob
+//!
+//! A Jellyfish Merkle Tree consists of [`Internal`] node and [`Leaf`] node. [`Internal`] node is
+//! like branch node in ethereum patricia merkle with 16 children to represent a 4-level binary
+//! tree and [`Leaf`] node is similar to that in patricia merkle too. In the above figure, each
+//! `bell` in the jellyfish is an [`Internal`] node while each tentacle is a [`Leaf`] node. It is
+//! noted that Jellyfish merkle doesn't have a counterpart for `extension` node of ethereum patricia
+//! merkle.
+//! [Internal]: crate::node_type::Internal
+//! [Leaf]: crate::node_type::Leaf
+
+#![allow(clippy::unit_arg)]
+
 #[cfg(test)]
 mod jellyfish_merkle_test;
 #[cfg(test)]
 mod mock_tree_store;
+mod nibble;
 pub mod node_type;
 mod tree_cache;
 
 use crypto::{hash::CryptoHash, HashValue};
 use failure::prelude::*;
+use nibble::{skip_common_prefix, NibbleIterator, NibblePath};
 use node_type::{Child, Children, InternalNode, LeafNode, Node, NodeKey};
-use sparse_merkle::nibble_path::{skip_common_prefix, NibbleIterator, NibblePath};
+use proptest_derive::Arbitrary;
 use std::collections::{HashMap, HashSet};
 use tree_cache::TreeCache;
-use types::{
-    account_state_blob::AccountStateBlob, proof::definition::SparseMerkleProof,
-    transaction::Version,
-};
+use types::{account_state_blob::AccountStateBlob, proof::SparseMerkleProof, transaction::Version};
 
 /// The hardcoded maximum height of a [`JellyfishMerkleTree`] in nibbles.
 const ROOT_NIBBLE_HEIGHT: usize = HashValue::LENGTH * 2;
@@ -35,7 +94,7 @@ pub type NodeBatch = HashMap<NodeKey, Node>;
 pub type StaleNodeIndexBatch = HashSet<StaleNodeIndex>;
 
 /// Indicates a node becomes stale since `stale_since_version`.
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Arbitrary, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct StaleNodeIndex {
     /// The version since when the node is overwritten and becomes stale.
     pub stale_since_version: Version,
@@ -45,20 +104,15 @@ pub struct StaleNodeIndex {
     pub node_key: NodeKey,
 }
 
-/// This is a wrapper of [`NodeBatch`] and [`StaleNodeIndexBatch`] that represents the incremental
-/// updates of a tree and pruning indices after applying a write set, which is a vector of
-/// `hashed_account_address` and `new_account_state_blob` pairs.
+/// This is a wrapper of [`NodeBatch`], [`StaleNodeIndexBatch`] and some stats of nodes that
+/// represents the incremental updates of a tree and pruning indices after applying a write set,
+/// which is a vector of `hashed_account_address` and `new_account_state_blob` pairs.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TreeUpdateBatch {
-    node_batch: NodeBatch,
-    stale_node_index_batch: StaleNodeIndexBatch,
-}
-
-/// Conversion between tuple type and [`TreeUpdateBatch`].
-impl From<TreeUpdateBatch> for (NodeBatch, StaleNodeIndexBatch) {
-    fn from(batch: TreeUpdateBatch) -> Self {
-        (batch.node_batch, batch.stale_node_index_batch)
-    }
+    pub node_batch: NodeBatch,
+    pub stale_node_index_batch: StaleNodeIndexBatch,
+    pub num_new_leaves: usize,
+    pub num_stale_leaves: usize,
 }
 
 /// The Jellyfish Merkle tree data structure. See [`crate`] for description.
@@ -169,23 +223,15 @@ where
         let mut nibble_iter = nibble_path.nibbles();
 
         // Start insertion from the root node.
-        let (new_root_node_key, _) = match root_node_key {
-            Some(root_node_key) => Self::insert_at(
-                root_node_key.clone(),
-                version,
-                &mut nibble_iter,
-                blob,
-                tree_cache,
-            )?,
-            None => Self::create_leaf_node(
-                NodeKey::new_empty_path(version),
-                &nibble_iter,
-                blob,
-                tree_cache,
-            )?,
-        };
+        let (new_root_node_key, _) = Self::insert_at(
+            root_node_key.clone(),
+            version,
+            &mut nibble_iter,
+            blob,
+            tree_cache,
+        )?;
 
-        tree_cache.set_root_node_key(Some(new_root_node_key));
+        tree_cache.set_root_node_key(new_root_node_key);
         Ok(())
     }
 
@@ -218,6 +264,24 @@ where
                 blob,
                 tree_cache,
             ),
+            Node::Null => {
+                if node_key.nibble_path().num_nibbles() != 0 {
+                    bail!(
+                        "Null node exists for non-root node with node_key {:?}",
+                        node_key
+                    );
+                }
+                // delete the old null node if the at the same version.
+                if node_key.version() == version {
+                    tree_cache.delete_node(&node_key, false /* is_leaf */);
+                }
+                Self::create_leaf_node(
+                    NodeKey::new_empty_path(version),
+                    &nibble_iter,
+                    blob,
+                    tree_cache,
+                )
+            }
         }
     }
 
@@ -225,7 +289,7 @@ where
     /// `internal_node`. Returns the newly inserted node with its [`NodeKey`].
     fn insert_at_internal_node(
         mut node_key: NodeKey,
-        mut internal_node: InternalNode,
+        internal_node: InternalNode,
         version: Version,
         nibble_iter: &mut NibbleIterator,
         blob: AccountStateBlob,
@@ -233,7 +297,7 @@ where
     ) -> Result<(NodeKey, Node)> {
         // We always delete the existing internal node here because it will not be referenced anyway
         // since this version.
-        tree_cache.delete_node(&node_key);
+        tree_cache.delete_node(&node_key, false /* is_leaf */);
 
         // Find the next node to visit following the next nibble as index.
         let child_index = nibble_iter.next().expect("Ran out of nibbles");
@@ -252,16 +316,18 @@ where
         };
 
         // Reuse the current `InternalNode` in memory to create a new internal node.
-        internal_node.set_child(
+        let mut children: Children = internal_node.into();
+        children.insert(
             child_index,
             Child::new(new_child_node.hash(), version, new_child_node.is_leaf()),
         );
+        let new_internal_node = InternalNode::new(children);
 
         node_key.set_version(version);
 
         // Cache this new internal node.
-        tree_cache.put_node(node_key.clone(), internal_node.clone().into())?;
-        Ok((node_key, internal_node.into()))
+        tree_cache.put_node(node_key.clone(), new_internal_node.clone().into())?;
+        Ok((node_key, new_internal_node.into()))
     }
 
     /// Helper function for recursive insertion into the subtree that starts from the
@@ -277,7 +343,7 @@ where
         // We are on a leaf node but trying to insert another node, so we may diverge.
         // We always delete the existing leaf node here because it will not be referenced anyway
         // since this version.
-        tree_cache.delete_node(&node_key);
+        tree_cache.delete_node(&node_key, true /* is_leaf */);
 
         // 1. Make sure that the existing leaf nibble_path has the same prefix as the already
         // visited part of the nibble iter of the incoming key and advances the existing leaf
@@ -397,20 +463,17 @@ where
     pub fn get_with_proof(
         &self,
         key: HashValue,
-        version: Option<Version>,
+        version: Version,
     ) -> Result<(Option<AccountStateBlob>, SparseMerkleProof)> {
         // Empty tree just returns proof with no sibling hash.
-        let mut next_node_key = match version {
-            None => return Ok((None, SparseMerkleProof::new(None, vec![]))),
-            Some(version) => NodeKey::new_empty_path(version),
-        };
+        let mut next_node_key = NodeKey::new_empty_path(version);
         let mut siblings = vec![];
         let nibble_path = NibblePath::new(key.to_vec());
         let mut nibble_iter = nibble_path.nibbles();
 
         // We limit the number of loops here deliberately to avoid potential cyclic graph bugs
         // in the tree structure.
-        for _i in 0..ROOT_NIBBLE_HEIGHT {
+        for nibble_depth in 0..ROOT_NIBBLE_HEIGHT {
             let next_node = self.reader.get_node(&next_node_key)?;
             match next_node {
                 Node::Internal(internal_node) => {
@@ -440,17 +503,23 @@ where
                         ),
                     ));
                 }
+                Node::Null => {
+                    if nibble_depth == 0 {
+                        return Ok((None, SparseMerkleProof::new(None, vec![])));
+                    } else {
+                        bail!(
+                            "Non-root null node exists with node key {:?}",
+                            next_node_key
+                        );
+                    }
+                }
             }
         }
         bail!("Jellyfish Merkle tree has cyclic graph inside.");
     }
 
     #[cfg(test)]
-    pub fn get(
-        &self,
-        key: HashValue,
-        version: Option<Version>,
-    ) -> Result<Option<AccountStateBlob>> {
+    pub fn get(&self, key: HashValue, version: Version) -> Result<Option<AccountStateBlob>> {
         Ok(self.get_with_proof(key, version)?.0)
     }
 }

@@ -15,6 +15,7 @@ use canonical_serialization::CanonicalSerialize;
 use crypto::HashValue;
 use logger::prelude::*;
 use mirai_annotations::checked_verify_eq;
+use nextgen_crypto::ed25519::*;
 use serde::Serialize;
 use std::{
     collections::{
@@ -61,7 +62,7 @@ pub struct BlockTree<T> {
     /// The vote digest is a hash that covers both the proposal id and the state id.
     /// Thus, the structure of `id_to_votes` is as follows:
     /// HashMap<proposed_block_id, HashMap<vote_digest, LedgerInfoWithSignatures>>
-    id_to_votes: HashMap<HashValue, HashMap<HashValue, LedgerInfoWithSignatures>>,
+    id_to_votes: HashMap<HashValue, HashMap<HashValue, LedgerInfoWithSignatures<Ed25519Signature>>>,
     /// Map of block id to its completed quorum certificate (2f + 1 votes)
     id_to_quorum_cert: HashMap<HashValue, Arc<QuorumCert>>,
     /// To keep the IDs of the elements that have been pruned from the tree but not cleaned up yet.
@@ -72,7 +73,7 @@ pub struct BlockTree<T> {
 
 impl<T> BlockTree<T>
 where
-    T: Serialize + Default + Debug + CanonicalSerialize,
+    T: Serialize + Default + Debug + CanonicalSerialize + PartialEq,
 {
     pub(super) fn new(
         root: Block<T>,
@@ -169,25 +170,6 @@ where
 
     pub(super) fn get_quorum_cert_for_block(&self, block_id: HashValue) -> Option<Arc<QuorumCert>> {
         self.id_to_quorum_cert.get(&block_id).cloned()
-    }
-
-    pub(super) fn is_ancestor(
-        &self,
-        ancestor: &Block<T>,
-        block: &Block<T>,
-    ) -> Result<bool, BlockTreeError> {
-        let mut current_block = block;
-        while current_block.round() >= ancestor.round() {
-            let parent_id = current_block.parent_id();
-            current_block = self
-                .id_to_block
-                .get(&parent_id)
-                .ok_or(BlockTreeError::BlockNotFound { id: parent_id })?;
-            if current_block.id() == ancestor.id() {
-                return Ok(true);
-            }
-        }
-        Ok(false)
     }
 
     pub(super) fn insert_block(
@@ -424,20 +406,12 @@ where
     pub(super) fn get_all_block_id(&self) -> Vec<HashValue> {
         self.id_to_block.keys().cloned().collect()
     }
-
-    #[allow(dead_code)]
-    fn print_all_blocks(&self) {
-        println!("Printing all {} blocks", self.id_to_block.len());
-        for block in self.id_to_block.values() {
-            println!("{:?}", block);
-        }
-    }
 }
 
 #[cfg(test)]
 impl<T> BlockTree<T>
 where
-    T: Serialize + Default + Debug + CanonicalSerialize,
+    T: Serialize + Default + Debug + CanonicalSerialize + PartialEq,
 {
     /// Returns the number of blocks in the tree
     pub(super) fn len(&self) -> usize {

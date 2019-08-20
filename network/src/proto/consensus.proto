@@ -15,19 +15,15 @@ message ConsensusMsg {
     RequestBlock request_block = 3;
     RespondBlock respond_block = 4;
     TimeoutMsg timeout_msg = 5;
-    RequestChunk request_chunk = 6;
-    RespondChunk respond_chunk = 7;
-    SyncInfo sync_info = 8;
+    SyncInfo sync_info = 6;
   }
 }
 
 message Proposal {
   // The proposed block
   Block proposed_block = 1;
-  // Author of the proposal
-  bytes proposer = 2;
   // Information about the highest QC, LedgerInfo, TimeoutCertificate, etc.
-  SyncInfo sync_info = 3;
+  SyncInfo sync_info = 2;
 }
 
 message PacemakerTimeout {
@@ -157,11 +153,3 @@ message RespondBlock {
   // The responded block.
   repeated Block blocks = 2;
 }
-
-message RequestChunk {
-  uint64 start_version = 1;
-  QuorumCert target = 2;
-  uint64 batch_size = 3;
-}
-
-message RespondChunk { types.TransactionListWithProof txn_list_with_proof = 1; }

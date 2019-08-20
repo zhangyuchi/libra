@@ -29,6 +29,7 @@ pub mod proto;
 
 use crypto::HashValue;
 use failure::prelude::*;
+use nextgen_crypto::ed25519::*;
 #[cfg(any(test, feature = "testing"))]
 use proptest_derive::Arbitrary;
 use proto_conv::{FromProto, IntoProto};
@@ -36,40 +37,47 @@ use types::{
     account_address::AccountAddress,
     account_state_blob::AccountStateBlob,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
-    proof::definition::SparseMerkleProof,
+    proof::SparseMerkleProof,
     transaction::{TransactionListWithProof, TransactionToCommit, Version},
 };
 
-/// Helper to construct and parse [`proto::storage::GetAccountStateWithProofByStateRootRequest`]
+/// Helper to construct and parse [`proto::storage::GetAccountStateWithProofByVersionRequest`]
 ///
 /// It does so by implementing [`IntoProto`](#impl-IntoProto) and [`FromProto`](#impl-FromProto),
 /// providing [`into_proto`](IntoProto::into_proto) and [`from_proto`](FromProto::from_proto).
-#[derive(PartialEq, Eq, Clone, FromProto, IntoProto)]
-#[ProtoType(crate::proto::storage::GetAccountStateWithProofByStateRootRequest)]
-pub struct GetAccountStateWithProofByStateRootRequest {
+#[derive(PartialEq, Eq, Clone, IntoProto)]
+#[ProtoType(crate::proto::storage::GetAccountStateWithProofByVersionRequest)]
+pub struct GetAccountStateWithProofByVersionRequest {
     /// The access path to query with.
     pub address: AccountAddress,
 
-    /// the state root hash the query is based on.
-    pub state_root_hash: HashValue,
+    /// The version the query is based on.
+    pub version: Version,
 }
 
-impl GetAccountStateWithProofByStateRootRequest {
+impl GetAccountStateWithProofByVersionRequest {
     /// Constructor.
-    pub fn new(address: AccountAddress, state_root_hash: HashValue) -> Self {
-        Self {
-            address,
-            state_root_hash,
-        }
+    pub fn new(address: AccountAddress, version: Version) -> Self {
+        Self { address, version }
     }
 }
 
-/// Helper to construct and parse [`proto::storage::GetAccountStateWithProofByStateRootResponse`]
+impl FromProto for GetAccountStateWithProofByVersionRequest {
+    type ProtoType = crate::proto::storage::GetAccountStateWithProofByVersionRequest;
+
+    fn from_proto(mut object: Self::ProtoType) -> Result<Self> {
+        let address = AccountAddress::from_proto(object.take_address())?;
+        let version = object.get_version();
+        Ok(Self { address, version })
+    }
+}
+
+/// Helper to construct and parse [`proto::storage::GetAccountStateWithProofByVersionResponse`]
 ///
 /// It does so by implementing [`IntoProto`](#impl-IntoProto) and [`FromProto`](#impl-FromProto),
 /// providing [`into_proto`](IntoProto::into_proto) and [`from_proto`](FromProto::from_proto).
 #[derive(PartialEq, Eq, Clone)]
-pub struct GetAccountStateWithProofByStateRootResponse {
+pub struct GetAccountStateWithProofByVersionResponse {
     /// The account state blob requested.
     pub account_state_blob: Option<AccountStateBlob>,
 
@@ -77,7 +85,7 @@ pub struct GetAccountStateWithProofByStateRootResponse {
     pub sparse_merkle_proof: SparseMerkleProof,
 }
 
-impl GetAccountStateWithProofByStateRootResponse {
+impl GetAccountStateWithProofByVersionResponse {
     /// Constructor.
     pub fn new(
         account_state_blob: Option<AccountStateBlob>,
@@ -90,8 +98,8 @@ impl GetAccountStateWithProofByStateRootResponse {
     }
 }
 
-impl FromProto for GetAccountStateWithProofByStateRootResponse {
-    type ProtoType = crate::proto::storage::GetAccountStateWithProofByStateRootResponse;
+impl FromProto for GetAccountStateWithProofByVersionResponse {
+    type ProtoType = crate::proto::storage::GetAccountStateWithProofByVersionResponse;
 
     fn from_proto(mut object: Self::ProtoType) -> Result<Self> {
         let account_state_blob = if object.has_account_state_blob() {
@@ -108,8 +116,8 @@ impl FromProto for GetAccountStateWithProofByStateRootResponse {
     }
 }
 
-impl IntoProto for GetAccountStateWithProofByStateRootResponse {
-    type ProtoType = crate::proto::storage::GetAccountStateWithProofByStateRootResponse;
+impl IntoProto for GetAccountStateWithProofByVersionResponse {
+    type ProtoType = crate::proto::storage::GetAccountStateWithProofByVersionResponse;
 
     fn into_proto(self) -> Self::ProtoType {
         let mut object = Self::ProtoType::new();
@@ -123,7 +131,7 @@ impl IntoProto for GetAccountStateWithProofByStateRootResponse {
 }
 
 impl Into<(Option<AccountStateBlob>, SparseMerkleProof)>
-    for GetAccountStateWithProofByStateRootResponse
+    for GetAccountStateWithProofByVersionResponse
 {
     fn into(self) -> (Option<AccountStateBlob>, SparseMerkleProof) {
         (self.account_state_blob, self.sparse_merkle_proof)
@@ -139,7 +147,7 @@ impl Into<(Option<AccountStateBlob>, SparseMerkleProof)>
 pub struct SaveTransactionsRequest {
     pub txns_to_commit: Vec<TransactionToCommit>,
     pub first_version: Version,
-    pub ledger_info_with_signatures: Option<LedgerInfoWithSignatures>,
+    pub ledger_info_with_signatures: Option<LedgerInfoWithSignatures<Ed25519Signature>>,
 }
 
 impl SaveTransactionsRequest {
@@ -147,7 +155,7 @@ impl SaveTransactionsRequest {
     pub fn new(
         txns_to_commit: Vec<TransactionToCommit>,
         first_version: Version,
-        ledger_info_with_signatures: Option<LedgerInfoWithSignatures>,
+        ledger_info_with_signatures: Option<LedgerInfoWithSignatures<Ed25519Signature>>,
     ) -> Self {
         SaveTransactionsRequest {
             txns_to_commit,

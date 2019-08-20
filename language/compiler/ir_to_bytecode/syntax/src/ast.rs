@@ -117,9 +117,9 @@ pub struct StructName(String);
 /// A Move struct
 #[derive(Clone, Debug, PartialEq)]
 pub struct StructDefinition {
-    /// The struct will have kind resource if `resource_kind` is true
-    /// and a value otherwise
-    pub resource_kind: bool,
+    /// The struct will have kind resource if `is_nominal_resource` is true
+    /// and will be dependent on it's type arguments otherwise
+    pub is_nominal_resource: bool,
     /// Human-readable name for the struct that also serves as a nominal type
     pub name: StructName,
     /// the fields each instance has
@@ -163,12 +163,6 @@ pub enum FunctionVisibility {
     Internal,
 }
 
-#[derive(PartialEq, Debug, Clone)]
-pub enum FunctionAnnotation {
-    Requires(String),
-    Ensures(String),
-}
-
 /// The body of a Move function
 #[derive(PartialEq, Debug, Clone)]
 pub enum FunctionBody {
@@ -190,8 +184,11 @@ pub struct Function {
     pub visibility: FunctionVisibility,
     /// The type signature
     pub signature: FunctionSignature,
-    /// Annotations on the function
-    pub annotations: Vec<FunctionAnnotation>,
+    /// List of nominal resources (declared in this module) that the procedure might access
+    /// Either through: BorrowGlobal, MoveFrom, or transitively through another procedure
+    /// This list of acquires grants the borrow checker the ability to statically verify the safety
+    /// of references into global storage
+    pub acquires: Vec<StructName>,
     /// The code for the procedure
     pub body: FunctionBody,
 }
@@ -199,20 +196,10 @@ pub struct Function {
 //**************************************************************************************************
 // Types
 //**************************************************************************************************
-
-/// Used to annotate struct types as a resource or value
-#[derive(Debug, PartialEq, Clone)]
-pub enum Kind {
-    /// `R`
-    Resource,
-    /// `V`
-    Value,
-}
-
 /// Identifier for a struct definition. Tells us where to look in the storage layer to find the
 /// code associated with the interface
 #[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
-pub struct StructType {
+pub struct QualifiedStructIdent {
     /// Module name and address in which the struct is contained
     pub module: ModuleName,
     /// Name for the struct class. Should be unique among structs published under the same
@@ -220,9 +207,9 @@ pub struct StructType {
     pub name: StructName,
 }
 
-/// Type "name" of the type
+/// The type of a single value
 #[derive(Debug, PartialEq, Clone)]
-pub enum Tag {
+pub enum Type {
     /// `address`
     Address,
     /// `u64`
@@ -231,31 +218,13 @@ pub enum Tag {
     Bool,
     /// `bytearray`
     ByteArray,
-    /// `string`
+    /// `string`, currently unused
     String,
     /// A module defined struct
-    /// `n`
-    Struct(StructType),
+    Struct(QualifiedStructIdent),
+    /// A reference type, the bool flag indicates whether the reference is mutable
+    Reference(bool, Box<Type>),
 }
-
-/// The type of a single value
-#[derive(Debug, PartialEq, Clone)]
-pub enum Type {
-    /// A non reference type
-    /// `g` or `k#d.n`
-    Normal(Kind, Tag),
-    /// A reference type
-    /// `&t` or `&mut t`
-    Reference {
-        /// true if `&mut` and false if `&`
-        is_mutable: bool,
-        /// the kind, value or resource
-        kind: Kind,
-        /// the "name" of the type
-        tag: Tag,
-    },
-}
-
 //**************************************************************************************************
 // Statements
 //**************************************************************************************************
@@ -278,8 +247,6 @@ pub enum Builtin {
     /// Get the struct object (`StructName` resolved by current module) associated with the given
     /// address
     BorrowGlobal(StructName),
-    /// Returns the height of the current transaction.
-    GetHeight,
     /// Returns the price per gas unit the current transaction is willing to pay
     GetTxnGasUnitPrice,
     /// Returns the maximum units of gas the current transaction is willing to use
@@ -292,8 +259,6 @@ pub enum Builtin {
     GetTxnSequenceNumber,
     /// Returns the unit of gas remain to be used for now.
     GetGasRemaining,
-    /// Emit an event
-    EmitEvent,
 
     /// Publishing,
     /// Initialize a previously empty address by publishing a resource of type Account
@@ -381,8 +346,6 @@ pub enum Statement {
     WhileStatement(While),
     /// `loop { s }`
     LoopStatement(Loop),
-    VerifyStatement(String),
-    AssumeStatement(String),
     /// no-op that eases parsing in some places
     EmptyStatement,
 }
@@ -632,48 +595,41 @@ impl ModuleDefinition {
 }
 
 impl Type {
-    /// Creates a new non-reference type from the type's kind and tag
-    pub fn nonreference(kind: Kind, tag: Tag) -> Type {
-        Type::Normal(kind, tag)
+    /// Creates a new struct type
+    pub fn r#struct(ident: QualifiedStructIdent) -> Type {
+        Type::Struct(ident)
     }
 
     /// Creates a new reference type from its mutability and underlying type
-    pub fn reference(is_mutable: bool, annot: Type) -> Type {
-        match annot {
-            Type::Normal(kind, tag) => Type::Reference {
-                is_mutable,
-                kind,
-                tag,
-            },
-            _ => panic!("ICE expected Normal annotation"),
-        }
+    pub fn reference(is_mutable: bool, t: Type) -> Type {
+        Type::Reference(is_mutable, Box::new(t))
     }
 
     /// Creates a new address type
     pub fn address() -> Type {
-        Type::Normal(Kind::Value, Tag::Address)
+        Type::Address
     }
 
     /// Creates a new u64 type
     pub fn u64() -> Type {
-        Type::Normal(Kind::Value, Tag::U64)
+        Type::U64
     }
 
     /// Creates a new bool type
     pub fn bool() -> Type {
-        Type::Normal(Kind::Value, Tag::Bool)
+        Type::Bool
     }
 
     /// Creates a new bytearray type
     pub fn bytearray() -> Type {
-        Type::Normal(Kind::Value, Tag::ByteArray)
+        Type::ByteArray
     }
 }
 
-impl StructType {
+impl QualifiedStructIdent {
     /// Creates a new StructType handle from the name of the module alias and the name of the struct
     pub fn new(module: ModuleName, name: StructName) -> Self {
-        StructType { module, name }
+        QualifiedStructIdent { module, name }
     }
 
     /// Accessor for the module alias
@@ -727,9 +683,9 @@ impl StructDefinition {
     /// types
     /// Does not verify the correctness of any internal properties, e.g. doesn't check that the
     /// fields do not have reference types
-    pub fn move_declared(resource_kind: bool, name: String, fields: Fields<Type>) -> Self {
+    pub fn move_declared(is_nominal_resource: bool, name: String, fields: Fields<Type>) -> Self {
         StructDefinition {
-            resource_kind,
+            is_nominal_resource,
             name: StructName::new(name),
             fields: StructDefinitionFields::Move { fields },
         }
@@ -738,9 +694,9 @@ impl StructDefinition {
     /// Creates a new StructDefinition from the resource kind (true if resource), the string
     /// representation of the name, and the user specified fields, a map from their names to their
     /// types
-    pub fn native(resource_kind: bool, name: String) -> Self {
+    pub fn native(is_nominal_resource: bool, name: String) -> Self {
         StructDefinition {
-            resource_kind,
+            is_nominal_resource,
             name: StructName::new(name),
             fields: StructDefinitionFields::Native,
         }
@@ -781,14 +737,14 @@ impl Function {
         visibility: FunctionVisibility,
         formals: Vec<(Var, Type)>,
         return_type: Vec<Type>,
-        annotations: Vec<FunctionAnnotation>,
+        acquires: Vec<StructName>,
         body: FunctionBody,
     ) -> Self {
         let signature = FunctionSignature::new(formals, return_type);
         Function {
             visibility,
             signature,
-            annotations,
+            acquires,
             body,
         }
     }
@@ -1135,52 +1091,23 @@ impl fmt::Display for FunctionSignature {
     }
 }
 
-impl fmt::Display for Kind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Kind::Resource => write!(f, "R"),
-            Kind::Value => write!(f, "V"),
-        }
-    }
-}
-
-impl fmt::Display for StructType {
+impl fmt::Display for QualifiedStructIdent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}.{}", self.module, self.name.name())
-    }
-}
-
-impl fmt::Display for Tag {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Tag::U64 => write!(f, "u64"),
-            Tag::Bool => write!(f, "bool"),
-            Tag::Address => write!(f, "address"),
-            Tag::ByteArray => write!(f, "bytearray"),
-            Tag::String => write!(f, "string"),
-            Tag::Struct(ty) => write!(f, "{}", ty),
-        }
-    }
-}
-
-fn write_kind_tag(f: &mut fmt::Formatter<'_>, k: &Kind, t: &Tag) -> fmt::Result {
-    match t {
-        Tag::Struct(_) => write!(f, "{}#{}", k, t),
-        _ => write!(f, "{}", t),
     }
 }
 
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Type::Normal(k, t) => write_kind_tag(f, k, t),
-            Type::Reference {
-                kind,
-                tag,
-                is_mutable,
-            } => {
-                write!(f, "&{}", if *is_mutable { "mut " } else { "" })?;
-                write_kind_tag(f, kind, tag)
+            Type::U64 => write!(f, "u64"),
+            Type::Bool => write!(f, "bool"),
+            Type::Address => write!(f, "address"),
+            Type::ByteArray => write!(f, "bytearray"),
+            Type::String => write!(f, "string"),
+            Type::Struct(ident) => write!(f, "{}", ident),
+            Type::Reference(is_mutable, t) => {
+                write!(f, "&{}{}", if *is_mutable { "mut " } else { "" }, t)
             }
         }
     }
@@ -1197,10 +1124,8 @@ impl fmt::Display for Builtin {
         match self {
             Builtin::CreateAccount => write!(f, "create_account"),
             Builtin::Release => write!(f, "release"),
-            Builtin::EmitEvent => write!(f, "log"),
             Builtin::Exists(t) => write!(f, "exists<{}>", t),
             Builtin::BorrowGlobal(t) => write!(f, "borrow_global<{}>", t),
-            Builtin::GetHeight => write!(f, "get_height"),
             Builtin::GetTxnMaxGasUnits => write!(f, "get_txn_max_gas_units"),
             Builtin::GetTxnGasUnitPrice => write!(f, "get_txn_gas_unit_price"),
             Builtin::GetTxnPublicKey => write!(f, "get_txn_public_key"),
@@ -1299,8 +1224,6 @@ impl fmt::Display for Statement {
             Statement::IfElseStatement(if_else) => write!(f, "{}", if_else),
             Statement::WhileStatement(while_) => write!(f, "{}", while_),
             Statement::LoopStatement(loop_) => write!(f, "{}", loop_),
-            Statement::VerifyStatement(cond) => write!(f, "verify<{}>)", cond),
-            Statement::AssumeStatement(cond) => write!(f, "assume<{}>", cond),
             Statement::EmptyStatement => write!(f, "<empty statement>"),
         }
     }

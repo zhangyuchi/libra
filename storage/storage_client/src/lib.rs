@@ -9,20 +9,20 @@
 
 mod state_view;
 
-use crypto::HashValue;
 use failure::prelude::*;
 use futures::{compat::Future01CompatExt, executor::block_on, prelude::*};
 use futures_01::future::Future as Future01;
 use grpcio::{ChannelBuilder, Environment};
 use metrics::counters::SVC_COUNTERS;
+use nextgen_crypto::ed25519::*;
 use proto_conv::{FromProto, IntoProto};
 use protobuf::Message;
 use rand::Rng;
 use std::{pin::Pin, sync::Arc};
 use storage_proto::{
     proto::{storage::GetExecutorStartupInfoRequest, storage_grpc},
-    ExecutorStartupInfo, GetAccountStateWithProofByStateRootRequest,
-    GetAccountStateWithProofByStateRootResponse, GetExecutorStartupInfoResponse,
+    ExecutorStartupInfo, GetAccountStateWithProofByVersionRequest,
+    GetAccountStateWithProofByVersionResponse, GetExecutorStartupInfoResponse,
     GetTransactionsRequest, GetTransactionsResponse, SaveTransactionsRequest,
 };
 use types::{
@@ -105,8 +105,8 @@ impl StorageRead for StorageReadServiceClient {
         requested_items: Vec<RequestItem>,
     ) -> Result<(
         Vec<ResponseItem>,
-        LedgerInfoWithSignatures,
-        Vec<ValidatorChangeEventWithProof>,
+        LedgerInfoWithSignatures<Ed25519Signature>,
+        Vec<ValidatorChangeEventWithProof<Ed25519Signature>>,
     )> {
         block_on(self.update_to_latest_ledger_async(client_known_version, requested_items))
     }
@@ -120,8 +120,8 @@ impl StorageRead for StorageReadServiceClient {
             dyn Future<
                     Output = Result<(
                         Vec<ResponseItem>,
-                        LedgerInfoWithSignatures,
-                        Vec<ValidatorChangeEventWithProof>,
+                        LedgerInfoWithSignatures<Ed25519Signature>,
+                        Vec<ValidatorChangeEventWithProof<Ed25519Signature>>,
                     )>,
                 > + Send,
         >,
@@ -177,27 +177,27 @@ impl StorageRead for StorageReadServiceClient {
             .boxed()
     }
 
-    fn get_account_state_with_proof_by_state_root(
+    fn get_account_state_with_proof_by_version(
         &self,
         address: AccountAddress,
-        state_root_hash: HashValue,
+        version: Version,
     ) -> Result<(Option<AccountStateBlob>, SparseMerkleProof)> {
-        block_on(self.get_account_state_with_proof_by_state_root_async(address, state_root_hash))
+        block_on(self.get_account_state_with_proof_by_version_async(address, version))
     }
 
-    fn get_account_state_with_proof_by_state_root_async(
+    fn get_account_state_with_proof_by_version_async(
         &self,
         address: AccountAddress,
-        state_root_hash: HashValue,
+        version: Version,
     ) -> Pin<Box<dyn Future<Output = Result<(Option<AccountStateBlob>, SparseMerkleProof)>> + Send>>
     {
-        let req = GetAccountStateWithProofByStateRootRequest::new(address, state_root_hash);
+        let req = GetAccountStateWithProofByVersionRequest::new(address, version);
         convert_grpc_response(
             self.client()
-                .get_account_state_with_proof_by_state_root_async(&log_and_convert(req)),
+                .get_account_state_with_proof_by_version_async(&log_and_convert(req)),
         )
         .map(|resp| {
-            let resp = GetAccountStateWithProofByStateRootResponse::from_proto(resp?)?;
+            let resp = GetAccountStateWithProofByVersionResponse::from_proto(resp?)?;
             Ok(resp.into())
         })
         .boxed()
@@ -248,7 +248,7 @@ impl StorageWrite for StorageWriteServiceClient {
         &self,
         txns_to_commit: Vec<TransactionToCommit>,
         first_version: Version,
-        ledger_info_with_sigs: Option<LedgerInfoWithSignatures>,
+        ledger_info_with_sigs: Option<LedgerInfoWithSignatures<Ed25519Signature>>,
     ) -> Result<()> {
         block_on(self.save_transactions_async(txns_to_commit, first_version, ledger_info_with_sigs))
     }
@@ -257,7 +257,7 @@ impl StorageWrite for StorageWriteServiceClient {
         &self,
         txns_to_commit: Vec<TransactionToCommit>,
         first_version: Version,
-        ledger_info_with_sigs: Option<LedgerInfoWithSignatures>,
+        ledger_info_with_sigs: Option<LedgerInfoWithSignatures<Ed25519Signature>>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>> {
         let req =
             SaveTransactionsRequest::new(txns_to_commit, first_version, ledger_info_with_sigs);
@@ -283,8 +283,8 @@ pub trait StorageRead: Send + Sync {
         request_items: Vec<RequestItem>,
     ) -> Result<(
         Vec<ResponseItem>,
-        LedgerInfoWithSignatures,
-        Vec<ValidatorChangeEventWithProof>,
+        LedgerInfoWithSignatures<Ed25519Signature>,
+        Vec<ValidatorChangeEventWithProof<Ed25519Signature>>,
     )>;
 
     /// See [`LibraDB::update_to_latest_ledger`].
@@ -300,8 +300,8 @@ pub trait StorageRead: Send + Sync {
             dyn Future<
                     Output = Result<(
                         Vec<ResponseItem>,
-                        LedgerInfoWithSignatures,
-                        Vec<ValidatorChangeEventWithProof>,
+                        LedgerInfoWithSignatures<Ed25519Signature>,
+                        Vec<ValidatorChangeEventWithProof<Ed25519Signature>>,
                     )>,
                 > + Send,
         >,
@@ -329,24 +329,24 @@ pub trait StorageRead: Send + Sync {
         fetch_events: bool,
     ) -> Pin<Box<dyn Future<Output = Result<TransactionListWithProof>> + Send>>;
 
-    /// See [`LibraDB::get_account_state_with_proof_by_state_root`].
+    /// See [`LibraDB::get_account_state_with_proof_by_version`].
     ///
-    /// [`LibraDB::get_account_state_with_proof_by_state_root`]:
-    /// ../libradb/struct.LibraDB.html#method.get_account_state_with_proof_by_state_root
-    fn get_account_state_with_proof_by_state_root(
+    /// [`LibraDB::get_account_state_with_proof_by_version`]:
+    /// ../libradb/struct.LibraDB.html#method.get_account_state_with_proof_by_version
+    fn get_account_state_with_proof_by_version(
         &self,
         address: AccountAddress,
-        state_root_hash: HashValue,
+        version: Version,
     ) -> Result<(Option<AccountStateBlob>, SparseMerkleProof)>;
 
-    /// See [`LibraDB::get_account_state_with_proof_by_state_root`].
+    /// See [`LibraDB::get_account_state_with_proof_by_version`].
     ///
-    /// [`LibraDB::get_account_state_with_proof_by_state_root`]:
-    /// ../libradb/struct.LibraDB.html#method.get_account_state_with_proof_by_state_root
-    fn get_account_state_with_proof_by_state_root_async(
+    /// [`LibraDB::get_account_state_with_proof_by_version`]:
+    /// ../libradb/struct.LibraDB.html#method.get_account_state_with_proof_by_version
+    fn get_account_state_with_proof_by_version_async(
         &self,
         address: AccountAddress,
-        state_root_hash: HashValue,
+        version: Version,
     ) -> Pin<Box<dyn Future<Output = Result<(Option<AccountStateBlob>, SparseMerkleProof)>> + Send>>;
 
     /// See [`LibraDB::get_executor_startup_info`].
@@ -377,7 +377,7 @@ pub trait StorageWrite: Send + Sync {
         &self,
         txns_to_commit: Vec<TransactionToCommit>,
         first_version: Version,
-        ledger_info_with_sigs: Option<LedgerInfoWithSignatures>,
+        ledger_info_with_sigs: Option<LedgerInfoWithSignatures<Ed25519Signature>>,
     ) -> Result<()>;
 
     /// See [`LibraDB::save_transactions`].
@@ -387,7 +387,7 @@ pub trait StorageWrite: Send + Sync {
         &self,
         txns_to_commit: Vec<TransactionToCommit>,
         first_version: Version,
-        ledger_info_with_sigs: Option<LedgerInfoWithSignatures>,
+        ledger_info_with_sigs: Option<LedgerInfoWithSignatures<Ed25519Signature>>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 }
 

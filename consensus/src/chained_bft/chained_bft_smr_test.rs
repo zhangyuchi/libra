@@ -6,7 +6,7 @@ use crate::{
         block_storage::BlockReader,
         chained_bft_smr::{ChainedBftSMR, ChainedBftSMRConfig},
         common::Author,
-        consensus_types::proposal_info::ProposalInfo,
+        consensus_types::proposal_msg::ProposalMsg,
         network::ConsensusNetworkImpl,
         network_tests::NetworkPlayground,
         safety::vote_msg::VoteMsg,
@@ -18,8 +18,7 @@ use channel;
 use crypto::hash::CryptoHash;
 use futures::{channel::mpsc, executor::block_on, prelude::*};
 use network::validator_network::{ConsensusNetworkEvents, ConsensusNetworkSender};
-#[allow(unused_imports)]
-use nextgen_crypto::ed25519::{compat, *};
+use nextgen_crypto::ed25519::*;
 use proto_conv::FromProto;
 use std::sync::Arc;
 use types::{validator_signer::ValidatorSigner, validator_verifier::ValidatorVerifier};
@@ -41,8 +40,8 @@ struct SMRNode {
     peers: Arc<Vec<Author>>,
     proposer: Vec<Author>,
     smr_id: usize,
-    smr: ChainedBftSMR<TestPayload, Author>,
-    commit_cb_receiver: mpsc::UnboundedReceiver<LedgerInfoWithSignatures>,
+    smr: ChainedBftSMR<TestPayload>,
+    commit_cb_receiver: mpsc::UnboundedReceiver<LedgerInfoWithSignatures<Ed25519Signature>>,
     mempool: Arc<MockTransactionManager>,
     mempool_notif_receiver: mpsc::Receiver<usize>,
     storage: Arc<MockStorage<TestPayload>>,
@@ -97,7 +96,8 @@ impl SMRNode {
             storage.clone(),
             initial_data,
         );
-        let (commit_cb_sender, commit_cb_receiver) = mpsc::unbounded::<LedgerInfoWithSignatures>();
+        let (commit_cb_sender, commit_cb_receiver) =
+            mpsc::unbounded::<LedgerInfoWithSignatures<Ed25519Signature>>();
         let mut mp = MockTransactionManager::new();
         let commit_receiver = mp.take_commit_receiver();
         let mempool = Arc::new(mp);
@@ -188,7 +188,10 @@ impl SMRNode {
     }
 }
 
-fn verify_finality_proof(node: &SMRNode, ledger_info_with_sig: &LedgerInfoWithSignatures) {
+fn verify_finality_proof(
+    node: &SMRNode,
+    ledger_info_with_sig: &LedgerInfoWithSignatures<Ed25519Signature>,
+) {
     let ledger_info_hash = ledger_info_with_sig.ledger_info().hash();
     for (author, signature) in ledger_info_with_sig.signatures() {
         assert_eq!(
@@ -214,8 +217,7 @@ fn basic_start_test() {
         let mut msg = playground
             .wait_for_messages(1, NetworkPlayground::proposals_only)
             .await;
-        let first_proposal =
-            ProposalInfo::<Vec<u64>, Author>::from_proto(msg[0].1.take_proposal()).unwrap();
+        let first_proposal = ProposalMsg::<Vec<u64>>::from_proto(msg[0].1.take_proposal()).unwrap();
         assert_eq!(first_proposal.proposal.height(), 1);
         assert_eq!(first_proposal.proposal.parent_id(), genesis.id());
         assert_eq!(
@@ -279,10 +281,9 @@ fn basic_full_round() {
         let mut broadcast_proposals_2 = playground
             .wait_for_messages(1, NetworkPlayground::proposals_only)
             .await;
-        let next_proposal = ProposalInfo::<Vec<u64>, Author>::from_proto(
-            broadcast_proposals_2[0].1.take_proposal(),
-        )
-        .unwrap();
+        let next_proposal =
+            ProposalMsg::<Vec<u64>>::from_proto(broadcast_proposals_2[0].1.take_proposal())
+                .unwrap();
         assert_eq!(next_proposal.proposal.round(), 2);
         assert_eq!(next_proposal.proposal.height(), 2);
     });
@@ -705,8 +706,7 @@ fn aggregate_timeout_votes() {
         let mut msg = playground
             .wait_for_messages(2, NetworkPlayground::proposals_only)
             .await;
-        let first_proposal =
-            ProposalInfo::<Vec<u64>, Author>::from_proto(msg[0].1.take_proposal()).unwrap();
+        let first_proposal = ProposalMsg::<Vec<u64>>::from_proto(msg[0].1.take_proposal()).unwrap();
         let proposal_id = first_proposal.proposal.id();
         playground.drop_message_for(&nodes[0].author, nodes[1].author);
         playground.drop_message_for(&nodes[0].author, nodes[2].author);
@@ -750,5 +750,47 @@ fn aggregate_timeout_votes() {
                 .certified_block_id(),
             proposal_id
         );
+    });
+}
+
+#[test]
+/// Verify that the NIL blocks formed during timeouts can be used to form commit chains.
+fn chain_with_nil_blocks() {
+    let runtime = consensus_runtime();
+    let mut playground = NetworkPlayground::new(runtime.executor());
+
+    // The proposer node[0] sends 3 proposals, after that its proposals are dropped and it cannot
+    // communicate with nodes 1 and 2. Nodes 1 and 2 should be able to commit the 3 proposal
+    // via NIL blocks commit chain.
+    let nodes = SMRNode::start_num_nodes(3, 2, &mut playground, FixedProposer);
+    block_on(async move {
+        // Wait for the first 3 proposals (each one sent to two nodes).
+        playground
+            .wait_for_messages(2 * 3, NetworkPlayground::proposals_only)
+            .await;
+        playground.drop_message_for(&nodes[0].author, nodes[1].author);
+        playground.drop_message_for(&nodes[0].author, nodes[2].author);
+
+        // After the first timeout nodes 1 and 2 should have last_proposal votes and
+        // they can generate its QC independently.
+        // Upon the second timeout nodes 1 and 2 send NIL block_1 with a QC to last_proposal.
+        // Upon the third timeout nodes 1 and 2 send NIL block_2 with a QC to NIL block_1.
+        // G <- p1 <- p2 <- p3 <- NIL1 <- NIL2
+        playground
+            .wait_for_messages(4 * 3, NetworkPlayground::timeout_msg_only)
+            .await;
+        // We can't guarantee the timing of the last timeout processing, the only thing we can
+        // look at is that HQC round is at least 4.
+        assert!(
+            nodes[2]
+                .smr
+                .block_store()
+                .unwrap()
+                .highest_quorum_cert()
+                .certified_block_round()
+                >= 4
+        );
+
+        assert!(nodes[2].smr.block_store().unwrap().root().round() >= 1)
     });
 }

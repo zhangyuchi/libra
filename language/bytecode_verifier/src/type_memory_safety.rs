@@ -9,11 +9,12 @@ use crate::{
     control_flow_graph::VMControlFlowGraph,
     nonce::Nonce,
 };
+use mirai_annotations::checked_verify;
 use std::collections::{BTreeMap, BTreeSet};
 use vm::{
     access::ModuleAccess,
     errors::VMStaticViolation,
-    file_format::{Bytecode, CompiledModule, FunctionDefinition, LocalIndex, SignatureToken},
+    file_format::{Bytecode, CompiledModule, FunctionDefinition, Kind, LocalIndex, SignatureToken},
     views::{
         FunctionDefinitionView, FunctionSignatureView, LocalsSignatureView, SignatureTokenView,
         StructDefinitionView, ViewInternals,
@@ -54,11 +55,11 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
             } else {
                 locals.insert(
                     arg_idx as LocalIndex,
-                    AbstractValue::full_value(arg_type_view.is_resource()),
+                    AbstractValue::full_value(arg_type_view.kind()),
                 );
             }
         }
-        let initial_state = AbstractState::new(locals);
+        let initial_state = AbstractState::new(locals, BTreeMap::new());
         // nonces in [0, locals_signature_view.len()) are reserved for constructing canonical state
         let next_nonce = locals_signature_view.len();
         let mut verifier = Self {
@@ -118,6 +119,19 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
         existing_borrows.is_empty()
     }
 
+    fn is_readable_reference(
+        &self,
+        state: &AbstractState,
+        signature: &SignatureToken,
+        nonce: Nonce,
+    ) -> bool {
+        checked_verify!(signature.is_reference());
+        !signature.is_mutable_reference() || {
+            let borrowed_nonces = state.borrowed_nonces(nonce);
+            self.freeze_ok(state, borrowed_nonces)
+        }
+    }
+
     fn execute_inner(
         &mut self,
         mut state: &mut AbstractState,
@@ -127,7 +141,8 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
         match bytecode {
             Bytecode::Pop => {
                 let operand = self.stack.pop().unwrap();
-                if SignatureTokenView::new(self.module, &operand.signature).is_resource() {
+                let kind = SignatureTokenView::new(self.module, &operand.signature).kind();
+                if kind != Kind::Unrestricted {
                     Err(VMStaticViolation::PopResourceError(offset))
                 } else if operand.value.is_reference() {
                     Err(VMStaticViolation::PopReferenceError(offset))
@@ -161,7 +176,7 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
                     return Err(VMStaticViolation::StLocTypeMismatchError(offset));
                 }
                 if state.is_available(*idx) {
-                    if state.is_safe_to_destroy(*idx) {
+                    if state.is_local_safe_to_destroy(*idx) {
                         state.destroy_local(*idx);
                     } else {
                         return Err(VMStaticViolation::StLocUnsafeToDestroyError(offset));
@@ -176,16 +191,13 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
                 if error_code.signature != SignatureToken::U64 {
                     return Err(VMStaticViolation::AbortTypeMismatchError(offset));
                 }
-                *state = AbstractState::new(BTreeMap::new());
+                *state = AbstractState::new(BTreeMap::new(), BTreeMap::new());
                 Ok(())
             }
 
             Bytecode::Ret => {
-                for arg_idx in 0..self.locals_signature_view.len() {
-                    let idx = arg_idx as LocalIndex;
-                    if state.is_available(idx) && !state.is_safe_to_destroy(idx) {
-                        return Err(VMStaticViolation::RetUnsafeToDestroyError(offset));
-                    }
+                if !state.is_safe_to_destroy() {
+                    return Err(VMStaticViolation::RetUnsafeToDestroyError(offset));
                 }
                 for return_type_view in self
                     .function_definition_view
@@ -198,7 +210,7 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
                         return Err(VMStaticViolation::RetTypeMismatchError(offset));
                     }
                 }
-                *state = AbstractState::new(BTreeMap::new());
+                *state = AbstractState::new(BTreeMap::new(), BTreeMap::new());
                 Ok(())
             }
 
@@ -286,7 +298,7 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
             Bytecode::LdConst(_) => {
                 self.stack.push(StackAbstractValue {
                     signature: SignatureToken::U64,
-                    value: AbstractValue::full_value(false),
+                    value: AbstractValue::full_value(Kind::Unrestricted),
                 });
                 Ok(())
             }
@@ -294,7 +306,7 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
             Bytecode::LdAddr(_) => {
                 self.stack.push(StackAbstractValue {
                     signature: SignatureToken::Address,
-                    value: AbstractValue::full_value(false),
+                    value: AbstractValue::full_value(Kind::Unrestricted),
                 });
                 Ok(())
             }
@@ -302,7 +314,7 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
             Bytecode::LdStr(_) => {
                 self.stack.push(StackAbstractValue {
                     signature: SignatureToken::String,
-                    value: AbstractValue::full_value(false),
+                    value: AbstractValue::full_value(Kind::Unrestricted),
                 });
                 Ok(())
             }
@@ -310,7 +322,7 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
             Bytecode::LdByteArray(_) => {
                 self.stack.push(StackAbstractValue {
                     signature: SignatureToken::ByteArray,
-                    value: AbstractValue::full_value(false),
+                    value: AbstractValue::full_value(Kind::Unrestricted),
                 });
                 Ok(())
             }
@@ -318,7 +330,7 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
             Bytecode::LdTrue | Bytecode::LdFalse => {
                 self.stack.push(StackAbstractValue {
                     signature: SignatureToken::Bool,
-                    value: AbstractValue::full_value(false),
+                    value: AbstractValue::full_value(Kind::Unrestricted),
                 });
                 Ok(())
             }
@@ -335,16 +347,23 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
                         value: AbstractValue::Reference(nonce),
                     });
                     Ok(())
-                } else if signature_view.is_resource() {
-                    Err(VMStaticViolation::CopyLocResourceError(offset))
-                } else if state.is_full(state.local(*idx)) {
-                    self.stack.push(StackAbstractValue {
-                        signature: signature_view.as_inner().clone(),
-                        value: AbstractValue::full_value(false),
-                    });
-                    Ok(())
                 } else {
-                    Err(VMStaticViolation::CopyLocExistsBorrowError(offset))
+                    match signature_view.kind() {
+                        Kind::Resource | Kind::All => {
+                            Err(VMStaticViolation::CopyLocResourceError(offset))
+                        }
+                        Kind::Unrestricted => {
+                            if state.is_full(state.local(*idx)) {
+                                self.stack.push(StackAbstractValue {
+                                    signature: signature_view.as_inner().clone(),
+                                    value: AbstractValue::full_value(Kind::Unrestricted),
+                                });
+                                Ok(())
+                            } else {
+                                Err(VMStaticViolation::CopyLocExistsBorrowError(offset))
+                            }
+                        }
+                    }
                 }
             }
 
@@ -422,12 +441,12 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
                     } else {
                         self.stack.push(StackAbstractValue {
                             signature: return_type_view.as_inner().clone(),
-                            value: AbstractValue::full_value(return_type_view.is_resource()),
+                            value: AbstractValue::full_value(return_type_view.kind()),
                         });
                     }
                 }
-                for x in all_references_to_borrow_from {
-                    state.destroy_nonce(x);
+                for nonce in all_references_to_borrow_from {
+                    state.destroy_nonce(nonce);
                 }
                 Ok(())
             }
@@ -454,9 +473,15 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
                         }
                     }
                 }
+                // TODO Handle type arguments for kind
+                let kind = if struct_definition_view.is_nominal_resource() {
+                    Kind::Resource
+                } else {
+                    Kind::Unrestricted
+                };
                 self.stack.push(StackAbstractValue {
                     signature: SignatureToken::Struct(struct_definition.struct_handle, vec![]),
-                    value: AbstractValue::full_value(struct_definition_view.is_resource()),
+                    value: AbstractValue::full_value(kind),
                 });
                 Ok(())
             }
@@ -483,9 +508,7 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
                             let field_signature_view = field_definition_view.type_signature();
                             self.stack.push(StackAbstractValue {
                                 signature: field_signature_view.token().as_inner().clone(),
-                                value: AbstractValue::full_value(
-                                    field_signature_view.is_resource(),
-                                ),
+                                value: AbstractValue::full_value(field_signature_view.kind()),
                             })
                         }
                     }
@@ -494,40 +517,34 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
             }
 
             Bytecode::ReadRef => {
-                let operand = self.stack.pop().unwrap();
-                match operand.signature {
-                    SignatureToken::Reference(signature) => {
-                        let operand_nonce = operand.value.extract_nonce().unwrap().clone();
-                        if SignatureTokenView::new(self.module, &signature).is_resource() {
-                            Err(VMStaticViolation::ReadRefResourceError(offset))
-                        } else {
-                            self.stack.push(StackAbstractValue {
-                                signature: *signature,
-                                value: AbstractValue::full_value(false),
-                            });
-                            state.destroy_nonce(operand_nonce);
-                            Ok(())
-                        }
+                let StackAbstractValue {
+                    signature: operand_signature,
+                    value: operand_value,
+                } = self.stack.pop().unwrap();
+                if !operand_signature.is_reference() {
+                    return Err(VMStaticViolation::ReadRefTypeMismatchError(offset));
+                }
+                let operand_nonce = operand_value.extract_nonce().unwrap();
+                if !self.is_readable_reference(state, &operand_signature, operand_nonce.clone()) {
+                    Err(VMStaticViolation::ReadRefExistsMutableBorrowError(offset))
+                } else {
+                    let inner_signature = *match operand_signature {
+                        SignatureToken::Reference(signature) => signature,
+                        SignatureToken::MutableReference(signature) => signature,
+                        _ => panic!("Unreachable"),
+                    };
+                    if SignatureTokenView::new(self.module, &inner_signature).kind()
+                        != Kind::Unrestricted
+                    {
+                        Err(VMStaticViolation::ReadRefResourceError(offset))
+                    } else {
+                        self.stack.push(StackAbstractValue {
+                            signature: inner_signature,
+                            value: AbstractValue::full_value(Kind::Unrestricted),
+                        });
+                        state.destroy_nonce(operand_nonce.clone());
+                        Ok(())
                     }
-                    SignatureToken::MutableReference(signature) => {
-                        let operand_nonce = operand.value.extract_nonce().unwrap().clone();
-                        if SignatureTokenView::new(self.module, &signature).is_resource() {
-                            Err(VMStaticViolation::ReadRefResourceError(offset))
-                        } else {
-                            let borrowed_nonces = state.borrowed_nonces(operand_nonce.clone());
-                            if self.freeze_ok(&state, borrowed_nonces) {
-                                self.stack.push(StackAbstractValue {
-                                    signature: *signature,
-                                    value: AbstractValue::full_value(false),
-                                });
-                                state.destroy_nonce(operand_nonce);
-                                Ok(())
-                            } else {
-                                Err(VMStaticViolation::ReadRefExistsMutableBorrowError(offset))
-                            }
-                        }
-                    }
-                    _ => Err(VMStaticViolation::ReadRefTypeMismatchError(offset)),
                 }
             }
 
@@ -535,16 +552,23 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
                 let ref_operand = self.stack.pop().unwrap();
                 let val_operand = self.stack.pop().unwrap();
                 if let SignatureToken::MutableReference(signature) = ref_operand.signature {
-                    if SignatureTokenView::new(self.module, &signature).is_resource() {
-                        Err(VMStaticViolation::WriteRefResourceError(offset))
-                    } else if val_operand.signature != *signature {
-                        Err(VMStaticViolation::WriteRefTypeMismatchError(offset))
-                    } else if state.is_full(&ref_operand.value) {
-                        let ref_operand_nonce = ref_operand.value.extract_nonce().unwrap().clone();
-                        state.destroy_nonce(ref_operand_nonce);
-                        Ok(())
-                    } else {
-                        Err(VMStaticViolation::WriteRefExistsBorrowError(offset))
+                    let kind = SignatureTokenView::new(self.module, &signature).kind();
+                    match kind {
+                        Kind::Resource | Kind::All => {
+                            Err(VMStaticViolation::WriteRefResourceError(offset))
+                        }
+                        Kind::Unrestricted => {
+                            if val_operand.signature != *signature {
+                                Err(VMStaticViolation::WriteRefTypeMismatchError(offset))
+                            } else if state.is_full(&ref_operand.value) {
+                                let ref_operand_nonce =
+                                    ref_operand.value.extract_nonce().unwrap().clone();
+                                state.destroy_nonce(ref_operand_nonce);
+                                Ok(())
+                            } else {
+                                Err(VMStaticViolation::WriteRefExistsBorrowError(offset))
+                            }
+                        }
                     }
                 } else {
                     Err(VMStaticViolation::WriteRefNoMutableReferenceError(offset))
@@ -566,7 +590,7 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
                 {
                     self.stack.push(StackAbstractValue {
                         signature: SignatureToken::U64,
-                        value: AbstractValue::full_value(false),
+                        value: AbstractValue::full_value(Kind::Unrestricted),
                     });
                     Ok(())
                 } else {
@@ -582,7 +606,7 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
                 {
                     self.stack.push(StackAbstractValue {
                         signature: SignatureToken::Bool,
-                        value: AbstractValue::full_value(false),
+                        value: AbstractValue::full_value(Kind::Unrestricted),
                     });
                     Ok(())
                 } else {
@@ -595,7 +619,7 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
                 if operand.signature == SignatureToken::Bool {
                     self.stack.push(StackAbstractValue {
                         signature: SignatureToken::Bool,
-                        value: AbstractValue::full_value(false),
+                        value: AbstractValue::full_value(Kind::Unrestricted),
                     });
                     Ok(())
                 } else {
@@ -606,18 +630,26 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
             Bytecode::Eq | Bytecode::Neq => {
                 let operand1 = self.stack.pop().unwrap();
                 let operand2 = self.stack.pop().unwrap();
-                let is_resource =
-                    SignatureTokenView::new(self.module, &operand1.signature).is_resource();
-                if !is_resource && operand1.signature == operand2.signature {
+                let kind1 = SignatureTokenView::new(self.module, &operand1.signature).kind();
+                let is_copyable = kind1 == Kind::Unrestricted;
+                if is_copyable && operand1.signature == operand2.signature {
                     if let AbstractValue::Reference(nonce) = operand1.value {
-                        state.destroy_nonce(nonce);
+                        if self.is_readable_reference(state, &operand1.signature, nonce.clone()) {
+                            state.destroy_nonce(nonce);
+                        } else {
+                            return Err(VMStaticViolation::ReadRefExistsMutableBorrowError(offset));
+                        }
                     }
                     if let AbstractValue::Reference(nonce) = operand2.value {
-                        state.destroy_nonce(nonce);
+                        if self.is_readable_reference(state, &operand2.signature, nonce.clone()) {
+                            state.destroy_nonce(nonce);
+                        } else {
+                            return Err(VMStaticViolation::ReadRefExistsMutableBorrowError(offset));
+                        }
                     }
                     self.stack.push(StackAbstractValue {
                         signature: SignatureToken::Bool,
-                        value: AbstractValue::full_value(false),
+                        value: AbstractValue::full_value(Kind::Unrestricted),
                     });
                     Ok(())
                 } else {
@@ -633,7 +665,7 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
                 {
                     self.stack.push(StackAbstractValue {
                         signature: SignatureToken::Bool,
-                        value: AbstractValue::full_value(false),
+                        value: AbstractValue::full_value(Kind::Unrestricted),
                     });
                     Ok(())
                 } else {
@@ -642,12 +674,18 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
             }
 
             // TODO: Handle type actuals for generics
-            Bytecode::Exists(_, _) => {
+            Bytecode::Exists(idx, _) => {
+                let struct_definition = self.module.struct_def_at(*idx);
+                if !StructDefinitionView::new(self.module, struct_definition).is_nominal_resource()
+                {
+                    return Err(VMStaticViolation::ExistsNoResourceError(offset));
+                }
+
                 let operand = self.stack.pop().unwrap();
                 if operand.signature == SignatureToken::Address {
                     self.stack.push(StackAbstractValue {
                         signature: SignatureToken::Bool,
-                        value: AbstractValue::full_value(false),
+                        value: AbstractValue::full_value(Kind::Unrestricted),
                     });
                     Ok(())
                 } else {
@@ -658,13 +696,17 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
             // TODO: Handle type actuals for generics
             Bytecode::BorrowGlobal(idx, _) => {
                 let struct_definition = self.module.struct_def_at(*idx);
-                if !StructDefinitionView::new(self.module, struct_definition).is_resource() {
+                if !StructDefinitionView::new(self.module, struct_definition).is_nominal_resource()
+                {
                     return Err(VMStaticViolation::BorrowGlobalNoResourceError(offset));
+                } else if !state.global(*idx).is_empty() {
+                    return Err(VMStaticViolation::GlobalReferenceError(offset));
                 }
 
                 let operand = self.stack.pop().unwrap();
                 if operand.signature == SignatureToken::Address {
                     let nonce = self.get_nonce(&mut state);
+                    state.borrow_from_global_value(*idx, nonce.clone());
                     self.stack.push(StackAbstractValue {
                         signature: SignatureToken::MutableReference(Box::new(
                             SignatureToken::Struct(struct_definition.struct_handle, vec![]),
@@ -680,15 +722,18 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
             // TODO: Handle type actuals for generics
             Bytecode::MoveFrom(idx, _) => {
                 let struct_definition = self.module.struct_def_at(*idx);
-                if !StructDefinitionView::new(self.module, struct_definition).is_resource() {
+                if !StructDefinitionView::new(self.module, struct_definition).is_nominal_resource()
+                {
                     return Err(VMStaticViolation::MoveFromNoResourceError(offset));
+                } else if !state.global(*idx).is_empty() {
+                    return Err(VMStaticViolation::GlobalReferenceError(offset));
                 }
 
                 let operand = self.stack.pop().unwrap();
                 if operand.signature == SignatureToken::Address {
                     self.stack.push(StackAbstractValue {
                         signature: SignatureToken::Struct(struct_definition.struct_handle, vec![]),
-                        value: AbstractValue::full_value(true),
+                        value: AbstractValue::full_value(Kind::Resource),
                     });
                     Ok(())
                 } else {
@@ -699,7 +744,8 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
             // TODO: Handle type actuals for generics
             Bytecode::MoveToSender(idx, _) => {
                 let struct_definition = self.module.struct_def_at(*idx);
-                if !StructDefinitionView::new(self.module, struct_definition).is_resource() {
+                if !StructDefinitionView::new(self.module, struct_definition).is_nominal_resource()
+                {
                     return Err(VMStaticViolation::MoveToSenderNoResourceError(offset));
                 }
 
@@ -719,7 +765,7 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
             | Bytecode::GetTxnSequenceNumber => {
                 self.stack.push(StackAbstractValue {
                     signature: SignatureToken::U64,
-                    value: AbstractValue::full_value(false),
+                    value: AbstractValue::full_value(Kind::Unrestricted),
                 });
                 Ok(())
             }
@@ -727,7 +773,7 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
             Bytecode::GetTxnSenderAddress => {
                 self.stack.push(StackAbstractValue {
                     signature: SignatureToken::Address,
-                    value: AbstractValue::full_value(false),
+                    value: AbstractValue::full_value(Kind::Unrestricted),
                 });
                 Ok(())
             }
@@ -735,7 +781,7 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
             Bytecode::GetTxnPublicKey => {
                 self.stack.push(StackAbstractValue {
                     signature: SignatureToken::ByteArray,
-                    value: AbstractValue::full_value(false),
+                    value: AbstractValue::full_value(Kind::Unrestricted),
                 });
                 Ok(())
             }
@@ -747,15 +793,6 @@ impl<'a> TypeAndMemorySafetyAnalysis<'a> {
                 } else {
                     Err(VMStaticViolation::CreateAccountTypeMismatchError(offset))
                 }
-            }
-
-            Bytecode::EmitEvent => {
-                // TODO: EmitEvent is currently unimplemented
-                //       following is a workaround to skip the check
-                self.stack.pop();
-                self.stack.pop();
-                self.stack.pop();
-                Ok(())
             }
         }
     }

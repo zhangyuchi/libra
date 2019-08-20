@@ -61,7 +61,7 @@ macro_rules! add {
         let expected_signature = FunctionSignature {
             return_types: $ret,
             arg_types: $args,
-            kind_constraints: $kinds,
+            type_parameters: $kinds,
         };
         let f = NativeFunction {
             dispatch: $dis,
@@ -87,7 +87,7 @@ fn tstruct(
     let native_struct = dispatch_native_struct(&id, function_name).unwrap();
     let idx = native_struct.expected_index;
     // TODO assert kinds match
-    assert!(args.len() == native_struct.expected_type_parameters.len());
+    assert_eq!(args.len(), native_struct.expected_type_parameters.len());
     SignatureToken::Struct(idx, args)
 }
 
@@ -153,6 +153,12 @@ lazy_static! {
             vector::native_length,
             vec![Reference(Box::new(tstruct(addr, "Vector", "T", vec![])))],
             vec![U64]
+        );
+        // Event
+        add!(m, addr, "Event", "write_to_event_store",
+            |_| { NativeReturnStatus::InvalidArguments },
+            vec![ByteArray, U64, ByteArray],
+            vec![]
         );
         m
     };

@@ -248,6 +248,11 @@ impl BoundsCheck for &FunctionDefinition {
         ]
         .into_iter()
         .flatten()
+        .chain(
+            self.acquires_global_resources
+                .iter()
+                .flat_map(|idx| check_bounds_impl(&module.struct_defs, *idx)),
+        )
         .collect()
     }
 }
@@ -374,7 +379,7 @@ impl FunctionDefinition {
                     | ReadRef | WriteRef | Add | Sub | Mul | Mod | Div | BitOr | BitAnd | Xor
                     | Or | And | Not | Eq | Neq | Lt | Gt | Le | Ge | Abort
                     | GetTxnGasUnitPrice | GetTxnMaxGasUnits | GetGasRemaining
-                    | GetTxnSenderAddress | CreateAccount | EmitEvent | GetTxnSequenceNumber
+                    | GetTxnSenderAddress | CreateAccount | GetTxnSequenceNumber
                     | GetTxnPublicKey => None,
                 }
             })

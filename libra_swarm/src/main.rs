@@ -1,6 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+use config::config::RoleType;
+use config_builder::swarm_config::LibraSwarmTopology;
 use libra_swarm::{client, swarm::LibraSwarm};
 use std::path::Path;
 use structopt::StructOpt;
@@ -34,6 +36,9 @@ struct Args {
 fn main() {
     let args = Args::from_args();
     let num_nodes = args.num_nodes.unwrap_or(1);
+    // topology indicates structure of the validator network
+    // e.g. num of validators, num of full nodes and their children
+    let topology = LibraSwarmTopology::create_validator_network(num_nodes);
 
     let (faucet_account_keypair, faucet_key_file_path, _temp_dir) =
         generate_keypair::load_faucet_key_or_create_default(args.faucet_key_path);
@@ -44,7 +49,7 @@ fn main() {
     );
 
     let swarm = LibraSwarm::launch_swarm(
-        num_nodes,
+        topology,
         !args.enable_logging,
         faucet_account_keypair,
         false, /* tee_logs */
@@ -70,7 +75,7 @@ fn main() {
     let tmp_mnemonic_file = tempfile::NamedTempFile::new().unwrap();
     if args.start_client {
         let client = client::InteractiveClient::new_with_inherit_io(
-            *swarm.get_validators_public_ports().get(0).unwrap(),
+            swarm.get_ac_port(0, RoleType::Validator),
             Path::new(&faucet_key_file_path),
             &tmp_mnemonic_file.into_temp_path(),
             swarm.get_trusted_peers_config_path(),
