@@ -266,7 +266,7 @@ fn serialize_struct_handle(binary: &mut BinaryData, struct_handle: &StructHandle
     write_u16_as_uleb128(binary, struct_handle.module.0)?;
     write_u16_as_uleb128(binary, struct_handle.name.0)?;
     serialize_nominal_resource_flag(binary, struct_handle.is_nominal_resource)?;
-    serialize_kinds(binary, &struct_handle.type_parameters)
+    serialize_kinds(binary, &struct_handle.type_formals)
 }
 
 /// Serializes a `FunctionHandle`.
@@ -440,7 +440,7 @@ fn serialize_function_signature(
     binary.push(SignatureType::FUNCTION_SIGNATURE as u8)?;
     serialize_signature_tokens(binary, &signature.return_types)?;
     serialize_signature_tokens(binary, &signature.arg_types)?;
-    serialize_kinds(binary, &signature.type_parameters)
+    serialize_kinds(binary, &signature.type_formals)
 }
 
 /// Serializes a `LocalsSignature`.
@@ -600,12 +600,20 @@ fn serialize_instruction_inner(binary: &mut BinaryData, opcode: &Bytecode) -> Re
             binary.push(Opcodes::ST_LOC as u8)?;
             binary.push(*local_idx)
         }
-        Bytecode::BorrowLoc(local_idx) => {
-            binary.push(Opcodes::BORROW_LOC as u8)?;
+        Bytecode::MutBorrowLoc(local_idx) => {
+            binary.push(Opcodes::MUT_BORROW_LOC as u8)?;
             binary.push(*local_idx)
         }
-        Bytecode::BorrowField(field_idx) => {
-            binary.push(Opcodes::BORROW_FIELD as u8)?;
+        Bytecode::ImmBorrowLoc(local_idx) => {
+            binary.push(Opcodes::IMM_BORROW_LOC as u8)?;
+            binary.push(*local_idx)
+        }
+        Bytecode::MutBorrowField(field_idx) => {
+            binary.push(Opcodes::MUT_BORROW_FIELD as u8)?;
+            write_u16_as_uleb128(binary, field_idx.0)
+        }
+        Bytecode::ImmBorrowField(field_idx) => {
+            binary.push(Opcodes::IMM_BORROW_FIELD as u8)?;
             write_u16_as_uleb128(binary, field_idx.0)
         }
         Bytecode::Call(method_idx, types_idx) => {
@@ -657,7 +665,6 @@ fn serialize_instruction_inner(binary: &mut BinaryData, opcode: &Bytecode) -> Re
             write_u16_as_uleb128(binary, class_idx.0)?;
             write_u16_as_uleb128(binary, types_idx.0)
         }
-        Bytecode::ReleaseRef => binary.push(Opcodes::RELEASE_REF as u8),
         Bytecode::MoveFrom(class_idx, types_idx) => {
             binary.push(Opcodes::MOVE_FROM as u8)?;
             write_u16_as_uleb128(binary, class_idx.0)?;
@@ -889,7 +896,7 @@ impl CommonSerializer {
             for string in strings {
                 serialize_string(binary, string)?;
             }
-            self.string_pool.1 = checked_calculate_table_size(binary, self.string_pool.0)?;;
+            self.string_pool.1 = checked_calculate_table_size(binary, self.string_pool.0)?;
         }
         Ok(())
     }
@@ -906,7 +913,7 @@ impl CommonSerializer {
             for byte_array in byte_arrays {
                 serialize_byte_array(binary, byte_array)?;
             }
-            self.byte_array_pool.1 = checked_calculate_table_size(binary, self.byte_array_pool.0)?;;
+            self.byte_array_pool.1 = checked_calculate_table_size(binary, self.byte_array_pool.0)?;
         }
         Ok(())
     }
@@ -958,7 +965,7 @@ impl CommonSerializer {
                 serialize_function_signature(binary, signature)?;
             }
             self.function_signatures.1 =
-                checked_calculate_table_size(binary, self.function_signatures.0)?;;
+                checked_calculate_table_size(binary, self.function_signatures.0)?;
         }
         Ok(())
     }

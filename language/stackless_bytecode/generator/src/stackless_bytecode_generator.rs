@@ -92,13 +92,8 @@ impl<'a> StacklessBytecodeGenerator<'a> {
         match bytecode {
             Bytecode::Pop => {
                 self.temp_stack.pop();
+                self.code.push(StacklessBytecode::NoOp);
             }
-
-            Bytecode::ReleaseRef => {
-                let temp_index = self.temp_stack.pop().unwrap();
-                self.code.push(StacklessBytecode::ReleaseRef(temp_index));
-            }
-
             Bytecode::BrTrue(code_offset) => {
                 let temp_index = self.temp_stack.pop().unwrap();
                 self.code
@@ -151,9 +146,8 @@ impl<'a> StacklessBytecodeGenerator<'a> {
                 }
             }
 
-            Bytecode::BorrowField(field_definition_index) => {
+            Bytecode::MutBorrowField(field_definition_index) => {
                 let struct_ref_index = self.temp_stack.pop().unwrap();
-                let struct_ref_sig = self.local_types[struct_ref_index].clone();
                 let field_signature = self.get_field_signature(*field_definition_index);
 
                 let field_ref_index = self.temp_count;
@@ -165,13 +159,25 @@ impl<'a> StacklessBytecodeGenerator<'a> {
                     *field_definition_index,
                 ));
                 self.temp_count += 1;
-                if struct_ref_sig.is_mutable_reference() {
-                    self.local_types
-                        .push(SignatureToken::MutableReference(Box::new(field_signature)));
-                } else {
-                    self.local_types
-                        .push(SignatureToken::Reference(Box::new(field_signature)));
-                }
+                self.local_types
+                    .push(SignatureToken::MutableReference(Box::new(field_signature)));
+            }
+
+            Bytecode::ImmBorrowField(field_definition_index) => {
+                let struct_ref_index = self.temp_stack.pop().unwrap();
+                let field_signature = self.get_field_signature(*field_definition_index);
+
+                let field_ref_index = self.temp_count;
+                self.temp_stack.push(field_ref_index);
+
+                self.code.push(StacklessBytecode::BorrowField(
+                    field_ref_index,
+                    struct_ref_index,
+                    *field_definition_index,
+                ));
+                self.temp_count += 1;
+                self.local_types
+                    .push(SignatureToken::Reference(Box::new(field_signature)));
             }
 
             Bytecode::LdConst(number) => {
@@ -246,12 +252,23 @@ impl<'a> StacklessBytecodeGenerator<'a> {
                 self.temp_count += 1;
             }
 
-            Bytecode::BorrowLoc(idx) => {
+            Bytecode::MutBorrowLoc(idx) => {
                 let signature = self.locals_signature_view.token_at(*idx).as_inner().clone();
                 let temp_index = self.temp_count;
                 self.temp_stack.push(temp_index);
                 self.local_types
                     .push(SignatureToken::MutableReference(Box::new(signature)));
+                self.code
+                    .push(StacklessBytecode::BorrowLoc(temp_index, *idx));
+                self.temp_count += 1;
+            }
+
+            Bytecode::ImmBorrowLoc(idx) => {
+                let signature = self.locals_signature_view.token_at(*idx).as_inner().clone();
+                let temp_index = self.temp_count;
+                self.temp_stack.push(temp_index);
+                self.local_types
+                    .push(SignatureToken::Reference(Box::new(signature)));
                 self.code
                     .push(StacklessBytecode::BorrowLoc(temp_index, *idx));
                 self.temp_count += 1;

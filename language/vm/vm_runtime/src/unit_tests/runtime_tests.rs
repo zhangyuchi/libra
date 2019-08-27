@@ -4,7 +4,7 @@
 use super::*;
 use crate::{code_cache::module_cache::VMModuleCache, txn_executor::TransactionExecutor};
 use bytecode_verifier::{VerifiedModule, VerifiedScript};
-use nextgen_crypto::ed25519::compat;
+use crypto::ed25519::compat;
 use std::collections::HashMap;
 use types::{access_path::AccessPath, account_address::AccountAddress, byte_array::ByteArray};
 use vm::{
@@ -66,7 +66,7 @@ fn fake_script() -> VerifiedScript {
         function_signatures: vec![FunctionSignature {
             arg_types: vec![],
             return_types: vec![],
-            type_parameters: vec![],
+            type_formals: vec![],
         }],
         locals_signatures: vec![LocalsSignature(vec![])],
         string_pool: vec!["hello".to_string()],
@@ -176,7 +176,10 @@ fn test_simple_instruction_transition() {
     let data_cache = FakeDataCache::new();
     let mut vm =
         TransactionExecutor::new(module_cache, &data_cache, TransactionMetadata::default());
-    vm.execution_stack.push_frame(entry_func);
+    vm.execution_stack
+        .push_frame(entry_func)
+        .unwrap()
+        .expect("push to empty execution stack should succeed");
 
     test_simple_instruction(
         &mut vm,
@@ -358,7 +361,10 @@ fn test_arith_instructions() {
     let mut vm =
         TransactionExecutor::new(module_cache, &data_cache, TransactionMetadata::default());
 
-    vm.execution_stack.push_frame(entry_func);
+    vm.execution_stack
+        .push_frame(entry_func)
+        .unwrap()
+        .expect("push to empty execution stack should succeed");
 
     test_binop_instruction(
         &mut vm,
@@ -610,7 +616,7 @@ fn test_call() {
             FunctionSignature {
                 arg_types: vec![],
                 return_types: vec![],
-                type_parameters: vec![],
+                type_formals: vec![],
             },
         ),
         // () -> (), two locals
@@ -619,7 +625,7 @@ fn test_call() {
             FunctionSignature {
                 arg_types: vec![],
                 return_types: vec![],
-                type_parameters: vec![],
+                type_formals: vec![],
             },
         ),
         // (Int, Int) -> (), two locals,
@@ -628,7 +634,7 @@ fn test_call() {
             FunctionSignature {
                 arg_types: vec![SignatureToken::U64, SignatureToken::U64],
                 return_types: vec![],
-                type_parameters: vec![],
+                type_formals: vec![],
             },
         ),
         // (Int, Int) -> (), three locals,
@@ -641,7 +647,7 @@ fn test_call() {
             FunctionSignature {
                 arg_types: vec![SignatureToken::U64, SignatureToken::U64],
                 return_types: vec![],
-                type_parameters: vec![],
+                type_formals: vec![],
             },
         ),
     ]);
@@ -664,7 +670,10 @@ fn test_call() {
     let data_cache = FakeDataCache::new();
     let mut vm =
         TransactionExecutor::new(module_cache, &data_cache, TransactionMetadata::default());
-    vm.execution_stack.push_frame(fake_func);
+    vm.execution_stack
+        .push_frame(fake_func)
+        .unwrap()
+        .expect("push to empty execution stack should succeed");
 
     test_simple_instruction(
         &mut vm,
@@ -726,7 +735,10 @@ fn test_transaction_info() {
     let data_cache = FakeDataCache::new();
     let mut vm = TransactionExecutor::new(module_cache, &data_cache, txn_info);
 
-    vm.execution_stack.push_frame(entry_func);
+    vm.execution_stack
+        .push_frame(entry_func)
+        .unwrap()
+        .expect("push to empty execution stack should succeed");
 
     test_simple_instruction(
         &mut vm,

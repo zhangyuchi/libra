@@ -5,15 +5,16 @@
 use crate::{
     access_path::AccessPath,
     account_address::AccountAddress,
-    account_config::{AccountResource, EventHandle},
+    account_config::AccountResource,
     account_state_blob::AccountStateBlob,
     byte_array::ByteArray,
     contract_event::ContractEvent,
+    event::{EventHandle, EventKey},
     get_with_proof::{ResponseItem, UpdateToLatestLedgerResponse},
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
     proof::AccumulatorProof,
     transaction::{
-        Program, RawTransaction, SignatureCheckedTransaction, SignedTransaction,
+        Module, Program, RawTransaction, Script, SignatureCheckedTransaction, SignedTransaction,
         TransactionArgument, TransactionInfo, TransactionListWithProof, TransactionPayload,
         TransactionStatus, TransactionToCommit, Version,
     },
@@ -21,10 +22,11 @@ use crate::{
     vm_error::VMStatus,
     write_set::{WriteOp, WriteSet, WriteSetMut},
 };
-use crypto::{hash::CryptoHash, HashValue};
-use nextgen_crypto::{
+use crypto::{
     ed25519::{compat::keypair_strategy, *},
+    hash::CryptoHash,
     traits::*,
+    HashValue,
 };
 use proptest::{
     collection::{vec, SizeRange},
@@ -34,7 +36,7 @@ use proptest::{
 };
 use proptest_derive::Arbitrary;
 use proptest_helpers::Index;
-use std::{collections::HashMap, convert::TryFrom, time::Duration};
+use std::{collections::HashMap, time::Duration};
 
 prop_compose! {
     #[inline]
@@ -133,6 +135,22 @@ impl RawTransaction {
                             gas_unit_price,
                             Duration::from_secs(expiration_time_secs),
                         ),
+                        TransactionPayload::Module(module) => RawTransaction::new_module(
+                            sender,
+                            sequence_number,
+                            module,
+                            max_gas_amount,
+                            gas_unit_price,
+                            Duration::from_secs(expiration_time_secs),
+                        ),
+                        TransactionPayload::Script(script) => RawTransaction::new_script(
+                            sender,
+                            sequence_number,
+                            script,
+                            max_gas_amount,
+                            gas_unit_price,
+                            Duration::from_secs(expiration_time_secs),
+                        ),
                         TransactionPayload::WriteSet(write_set) => {
                             // It's a bit unfortunate that max_gas_amount etc is generated but
                             // not used, but it isn't a huge deal.
@@ -160,6 +178,18 @@ impl SignatureCheckedTransaction {
         keypair_strategy: impl Strategy<Value = (Ed25519PrivateKey, Ed25519PublicKey)>,
     ) -> impl Strategy<Value = Self> {
         Self::strategy_impl(keypair_strategy, TransactionPayload::program_strategy())
+    }
+
+    pub fn script_strategy(
+        keypair_strategy: impl Strategy<Value = (Ed25519PrivateKey, Ed25519PublicKey)>,
+    ) -> impl Strategy<Value = Self> {
+        Self::strategy_impl(keypair_strategy, TransactionPayload::script_strategy())
+    }
+
+    pub fn module_strategy(
+        keypair_strategy: impl Strategy<Value = (Ed25519PrivateKey, Ed25519PublicKey)>,
+    ) -> impl Strategy<Value = Self> {
+        Self::strategy_impl(keypair_strategy, TransactionPayload::module_strategy())
     }
 
     pub fn write_set_strategy(
@@ -220,6 +250,14 @@ impl TransactionPayload {
         any::<Program>().prop_map(TransactionPayload::Program)
     }
 
+    pub fn script_strategy() -> impl Strategy<Value = Self> {
+        any::<Script>().prop_map(TransactionPayload::Script)
+    }
+
+    pub fn module_strategy() -> impl Strategy<Value = Self> {
+        any::<Module>().prop_map(TransactionPayload::Module)
+    }
+
     pub fn write_set_strategy() -> impl Strategy<Value = Self> {
         any::<WriteSet>().prop_map(TransactionPayload::WriteSet)
     }
@@ -252,7 +290,9 @@ impl Arbitrary for TransactionPayload {
         // at least not choke on write set strategies so introduce them with decent probability.
         // The figures below are probability weights.
         prop_oneof![
-            9 => Self::program_strategy(),
+            4 => Self::program_strategy(),
+            4 => Self::script_strategy(),
+            1 => Self::module_strategy(),
             1 => Self::write_set_strategy(),
         ]
         .boxed()
@@ -277,6 +317,33 @@ impl Arbitrary for Program {
     }
 
     type Strategy = BoxedStrategy<Self>;
+}
+
+impl Arbitrary for Script {
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Self>;
+
+    fn arbitrary_with(_args: ()) -> Self::Strategy {
+        // XXX This should eventually be an actually valid program, maybe?
+        // The vector sizes are picked out of thin air.
+        (
+            vec(any::<u8>(), 0..100),
+            vec(any::<TransactionArgument>(), 0..10),
+        )
+            .prop_map(|(code, args)| Script::new(code, args))
+            .boxed()
+    }
+}
+
+impl Arbitrary for Module {
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Self>;
+
+    fn arbitrary_with(_args: ()) -> Self::Strategy {
+        // XXX How should we generate random modules?
+        // The vector sizes are picked out of thin air.
+        vec(any::<u8>(), 0..100).prop_map(Module::new).boxed()
+    }
 }
 
 impl Arbitrary for TransactionArgument {
@@ -350,20 +417,16 @@ impl Arbitrary for UpdateToLatestLedgerResponse<Ed25519Signature> {
 #[allow(clippy::implicit_hasher)]
 pub fn renumber_events(
     events: &[ContractEvent],
-    next_seq_num_by_access_path: &mut HashMap<AccessPath, u64>,
+    next_seq_num_by_access_path: &mut HashMap<EventKey, u64>,
 ) -> Vec<ContractEvent> {
     events
         .iter()
         .map(|e| {
             let next_seq_num = next_seq_num_by_access_path
-                .entry(e.access_path().clone())
+                .entry(e.key().clone())
                 .or_insert(0);
             *next_seq_num += 1;
-            ContractEvent::new(
-                e.access_path().clone(),
-                *next_seq_num - 1,
-                e.event_data().to_vec(),
-            )
+            ContractEvent::new(*e.key(), *next_seq_num - 1, e.event_data().to_vec())
         })
         .collect::<Vec<_>>()
 }
@@ -412,19 +475,14 @@ impl ContractEventGen {
     pub fn materialize(self, account_universe: &[&AccountResource]) -> ContractEvent {
         let account = self.event_handle_index.get(account_universe);
         let (event_key, seq) = if self.use_sent_key {
-            (
-                AccountAddress::try_from(account.sent_events().key())
-                    .expect("Event key size mismatch"),
-                account.sent_events().count(),
-            )
+            (*account.sent_events().key(), account.sent_events().count())
         } else {
             (
-                AccountAddress::try_from(account.received_events().key())
-                    .expect("Event key size mismatch"),
+                *account.received_events().key(),
                 account.received_events().count(),
             )
         };
-        ContractEvent::new(AccessPath::new(event_key, vec![]), seq, self.payload)
+        ContractEvent::new(event_key, seq, self.payload)
     }
 }
 
@@ -451,24 +509,21 @@ impl AccountResourceGen {
 
 impl ContractEvent {
     pub fn strategy_impl(
-        event_key_strategy: impl Strategy<Value = AccountAddress>,
+        event_key_strategy: impl Strategy<Value = EventKey>,
     ) -> impl Strategy<Value = Self> {
         (event_key_strategy, any::<u64>(), vec(any::<u8>(), 1..10)).prop_map(
-            |(event_key, seq_num, event_data)| {
-                ContractEvent::new(AccessPath::new(event_key, vec![]), seq_num, event_data)
-            },
+            |(event_key, seq_num, event_data)| ContractEvent::new(event_key, seq_num, event_data),
         )
     }
 }
 
 impl EventHandle {
     pub fn strategy_impl(
-        event_key_strategy: impl Strategy<Value = AccountAddress>,
+        event_key_strategy: impl Strategy<Value = EventKey>,
     ) -> impl Strategy<Value = Self> {
         // We only generate small counters so that it won't overflow.
-        (event_key_strategy, 0..std::u64::MAX / 2).prop_map(|(event_key, counter)| {
-            EventHandle::new(ByteArray::new(event_key.to_vec()), counter)
-        })
+        (event_key_strategy, 0..std::u64::MAX / 2)
+            .prop_map(|(event_key, counter)| EventHandle::new(event_key, counter))
     }
 }
 
@@ -477,14 +532,14 @@ impl Arbitrary for EventHandle {
     type Strategy = BoxedStrategy<Self>;
 
     fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-        EventHandle::strategy_impl(any::<AccountAddress>()).boxed()
+        EventHandle::strategy_impl(any::<EventKey>()).boxed()
     }
 }
 
 impl Arbitrary for ContractEvent {
     type Parameters = ();
     fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
-        ContractEvent::strategy_impl(any::<AccountAddress>()).boxed()
+        ContractEvent::strategy_impl(any::<EventKey>()).boxed()
     }
 
     type Strategy = BoxedStrategy<Self>;

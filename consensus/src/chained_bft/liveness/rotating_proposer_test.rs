@@ -5,18 +5,16 @@ use crate::chained_bft::{
     consensus_types::{block::Block, quorum_cert::QuorumCert},
     liveness::{proposer_election::ProposerElection, rotating_proposer_election::RotatingProposer},
 };
-use nextgen_crypto::ed25519::*;
-use std::sync::Arc;
 use types::validator_signer::ValidatorSigner;
 
 #[test]
 fn test_rotating_proposer() {
-    let chosen_validator_signer = ValidatorSigner::<Ed25519PrivateKey>::random([0u8; 32]);
+    let chosen_validator_signer = ValidatorSigner::random([0u8; 32]);
     let chosen_author = chosen_validator_signer.author();
-    let another_validator_signer = ValidatorSigner::<Ed25519PrivateKey>::random([1u8; 32]);
+    let another_validator_signer = ValidatorSigner::random([1u8; 32]);
     let another_author = another_validator_signer.author();
     let proposers = vec![chosen_author, another_author];
-    let pe: Arc<dyn ProposerElection<u32>> = Arc::new(RotatingProposer::new(proposers, 1));
+    let mut pe: Box<dyn ProposerElection<u32>> = Box::new(RotatingProposer::new(proposers, 1));
 
     // Send a proposal from both chosen author and another author, the only winning proposals
     // follow the round-robin rotation.
@@ -71,12 +69,12 @@ fn test_rotating_proposer() {
 
 #[test]
 fn test_rotating_proposer_with_three_contiguous_rounds() {
-    let chosen_validator_signer = ValidatorSigner::<Ed25519PrivateKey>::random([0u8; 32]);
+    let chosen_validator_signer = ValidatorSigner::random([0u8; 32]);
     let chosen_author = chosen_validator_signer.author();
-    let another_validator_signer = ValidatorSigner::<Ed25519PrivateKey>::random([1u8; 32]);
+    let another_validator_signer = ValidatorSigner::random([1u8; 32]);
     let another_author = another_validator_signer.author();
     let proposers = vec![chosen_author, another_author];
-    let pe: Arc<dyn ProposerElection<u32>> = Arc::new(RotatingProposer::new(proposers, 3));
+    let mut pe: Box<dyn ProposerElection<u32>> = Box::new(RotatingProposer::new(proposers, 3));
 
     // Send a proposal from both chosen author and another author, the only winning proposals
     // follow the round-robin rotation with 3 contiguous rounds.
@@ -128,12 +126,12 @@ fn test_rotating_proposer_with_three_contiguous_rounds() {
 
 #[test]
 fn test_fixed_proposer() {
-    let chosen_validator_signer = ValidatorSigner::<Ed25519PrivateKey>::random([0u8; 32]);
+    let chosen_validator_signer = ValidatorSigner::random([0u8; 32]);
     let chosen_author = chosen_validator_signer.author();
-    let another_validator_signer = ValidatorSigner::<Ed25519PrivateKey>::random([1u8; 32]);
+    let another_validator_signer = ValidatorSigner::random([1u8; 32]);
     let another_author = another_validator_signer.author();
-    let pe: Arc<dyn ProposerElection<u32>> =
-        Arc::new(RotatingProposer::new(vec![chosen_author], 1));
+    let mut pe: Box<dyn ProposerElection<u32>> =
+        Box::new(RotatingProposer::new(vec![chosen_author], 1));
 
     // Send a proposal from both chosen author and another author, the only winning proposal is
     // from the chosen author.

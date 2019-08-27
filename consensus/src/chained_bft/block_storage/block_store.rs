@@ -17,12 +17,11 @@ use logger::prelude::*;
 use crate::{chained_bft::persistent_storage::RecoveryData, state_replication::StateComputeResult};
 use crypto::hash::CryptoHash;
 use mirai_annotations::checked_precondition;
-use nextgen_crypto::ed25519::*;
 use std::{
     collections::{vec_deque::VecDeque, HashMap},
     sync::{Arc, RwLock},
 };
-use types::{ledger_info::LedgerInfo, validator_signer::ValidatorSigner};
+use types::{crypto_proxies::ValidatorSigner, ledger_info::LedgerInfo};
 
 #[cfg(test)]
 #[path = "block_store_test.rs"]
@@ -55,7 +54,7 @@ pub enum NeedFetchResult {
 ///             | -------------> D3
 pub struct BlockStore<T> {
     inner: Arc<RwLock<BlockTree<T>>>,
-    validator_signer: ValidatorSigner<Ed25519PrivateKey>,
+    validator_signer: ValidatorSigner,
     state_computer: Arc<dyn StateComputer<Payload = T>>,
     enforce_increasing_timestamps: bool,
     /// The persistent storage backing up the in-memory data structure, every write should go
@@ -67,7 +66,7 @@ impl<T: Payload> BlockStore<T> {
     pub async fn new(
         storage: Arc<dyn PersistentStorage<T>>,
         initial_data: RecoveryData<T>,
-        validator_signer: ValidatorSigner<Ed25519PrivateKey>,
+        validator_signer: ValidatorSigner,
         state_computer: Arc<dyn StateComputer<Payload = T>>,
         enforce_increasing_timestamps: bool,
         max_pruned_blocks_in_mem: usize,
@@ -159,7 +158,7 @@ impl<T: Payload> BlockStore<T> {
         *self.inner.write().unwrap() = tree;
     }
 
-    pub fn signer(&self) -> &ValidatorSigner<Ed25519PrivateKey> {
+    pub fn signer(&self) -> &ValidatorSigner {
         &self.validator_signer
     }
 
@@ -221,6 +220,10 @@ impl<T: Payload> BlockStore<T> {
         committed_block_id: HashValue,
         qc: &QuorumCert,
     ) -> bool {
+        // This precondition ensures that the check in the following lines
+        // does not result in an addition overflow.
+        checked_precondition!(self.root().round() < std::u64::MAX - 1);
+
         // LedgerInfo doesn't carry the information about the round of the committed block. However,
         // the 3-chain safety rules specify that the round of the committed block must be
         // certified_block_round() - 2. In case root().round() is greater than that the committed

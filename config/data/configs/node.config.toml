@@ -1,11 +1,9 @@
 # Defaults are now set in config.rs
 
-[base]
-peer_keypairs_file = ""  # For direct validation of this file
-trusted_peers_file = ""  # For direct validation of this file
-
 [network]
 seed_peers_file = ""  # For direct validation of this file
+peer_keypairs_file = ""  # For direct validation of this file
+trusted_peers_file = ""  # For direct validation of this file
 
 [execution]
 genesis_file_location = "<USE_TEMP_DIR>"
@@ -14,5 +12,8 @@ genesis_file_location = "<USE_TEMP_DIR>"
   [vm_config.publishing_options]
   type = "Locked"
   whitelist = [
-    "3084211481a1d068de874c35850d035088c58c449341f24798afdff8c10e63db", "ab6d0d8b06c960fecb794ba33aa79eebec2027be703cf4dcf8e422ea9c22b6e0", "ebbaad01befde0fa1513cd0763dfee2d6a0ea7bf5976f65c36ffdf2fda6a79e9", "83d98d151c37ac561d8dcb530308fb89ad9a3be0181d03452a2c422e4d41032d"
+    "adb97561e045f50bc55642fe0e1902c628c932da3bfa6b47abcc682909998c8a",
+    "87f912647981e1c66b54512aa49e277ecb215b134beaac27b9b2bc48443b3ea7",
+    "0979ee49a9e97ce81f4e9c5642cfe5b90f1cfb3af291dc969d84c93343fe9b86",
+    "d2218a399fe48448ab27973e7abb2a3e09b3f597347c0dd4480d6d786f2c7a14"
   ]

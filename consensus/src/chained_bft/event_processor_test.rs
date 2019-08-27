@@ -12,6 +12,7 @@ use crate::{
             sync_info::SyncInfo,
             timeout_msg::{PacemakerTimeout, PacemakerTimeoutCertificate, TimeoutMsg},
         },
+        epoch_manager::EpochManager,
         event_processor::EventProcessor,
         liveness::{
             pacemaker::{ExponentialTimeInterval, NewRoundEvent, NewRoundReason, Pacemaker},
@@ -40,43 +41,34 @@ use futures::{
     channel::{mpsc, oneshot},
     compat::Future01CompatExt,
     executor::block_on,
-    prelude::*,
 };
 use network::{
     proto::BlockRetrievalStatus,
     validator_network::{ConsensusNetworkEvents, ConsensusNetworkSender},
 };
-use nextgen_crypto::ed25519::*;
 use proto_conv::FromProto;
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use tokio::runtime::TaskExecutor;
-use types::{
-    ledger_info::LedgerInfoWithSignatures, validator_signer::ValidatorSigner,
-    validator_verifier::ValidatorVerifier,
-};
+use types::crypto_proxies::{LedgerInfoWithSignatures, ValidatorSigner, ValidatorVerifier};
 
 /// Auxiliary struct that is setting up node environment for the test.
 struct NodeSetup {
     author: Author,
     block_store: Arc<BlockStore<TestPayload>>,
     event_processor: EventProcessor<TestPayload>,
-    new_rounds_receiver: channel::Receiver<NewRoundEvent>,
     storage: Arc<MockStorage<TestPayload>>,
-    signer: ValidatorSigner<Ed25519PrivateKey>,
+    signer: ValidatorSigner,
     proposer_author: Author,
-    peers: Arc<Vec<Author>>,
-    #[allow(dead_code)]
-    commit_cb_receiver: mpsc::UnboundedReceiver<LedgerInfoWithSignatures<Ed25519Signature>>,
+    epoch_mgr: Arc<EpochManager>,
 }
 
 impl NodeSetup {
     fn build_empty_store(
-        signer: ValidatorSigner<Ed25519PrivateKey>,
+        signer: ValidatorSigner,
         storage: Arc<dyn PersistentStorage<TestPayload>>,
         initial_data: RecoveryData<TestPayload>,
     ) -> Arc<BlockStore<TestPayload>> {
-        let (commit_cb_sender, _commit_cb_receiver) =
-            mpsc::unbounded::<LedgerInfoWithSignatures<Ed25519Signature>>();
+        let (commit_cb_sender, _commit_cb_receiver) = mpsc::unbounded::<LedgerInfoWithSignatures>();
 
         Arc::new(block_on(BlockStore::new(
             storage,
@@ -88,36 +80,25 @@ impl NodeSetup {
         )))
     }
 
-    fn create_pacemaker(
-        time_service: Arc<dyn TimeService>,
-    ) -> (Pacemaker, channel::Receiver<NewRoundEvent>) {
+    fn create_pacemaker(time_service: Arc<dyn TimeService>) -> Pacemaker {
         let base_timeout = Duration::new(60, 0);
         let time_interval = Box::new(ExponentialTimeInterval::fixed(base_timeout));
-        let highest_certified_round = 0;
-        let (new_round_events_sender, new_round_events_receiver) = channel::new_test(1_024);
         let (pacemaker_timeout_sender, _) = channel::new_test(1_024);
-        (
-            Pacemaker::new(
-                MockStorage::<TestPayload>::start_for_testing()
-                    .0
-                    .persistent_liveness_storage(),
-                time_interval,
-                0,
-                highest_certified_round,
-                time_service,
-                new_round_events_sender,
-                pacemaker_timeout_sender,
-                1,
-                HighestTimeoutCertificates::new(None, None),
-            ),
-            new_round_events_receiver,
+        Pacemaker::new(
+            MockStorage::<TestPayload>::start_for_testing()
+                .0
+                .persistent_liveness_storage(),
+            time_interval,
+            time_service,
+            pacemaker_timeout_sender,
+            HighestTimeoutCertificates::default(),
         )
     }
 
     fn create_proposer_election(
         author: Author,
-    ) -> Arc<dyn ProposerElection<TestPayload> + Send + Sync> {
-        Arc::new(RotatingProposer::new(vec![author], 1))
+    ) -> Box<dyn ProposerElection<TestPayload> + Send + Sync> {
+        Box::new(RotatingProposer::new(vec![author], 1))
     }
 
     fn create_nodes(
@@ -126,14 +107,15 @@ impl NodeSetup {
         num_nodes: usize,
     ) -> Vec<NodeSetup> {
         let mut signers = vec![];
-        let mut peers = vec![];
+        let mut author_to_public_keys = HashMap::new();
         for i in 0..num_nodes {
             let signer = ValidatorSigner::random([i as u8; 32]);
-            peers.push(signer.author());
+            author_to_public_keys.insert(signer.author(), signer.public_key());
             signers.push(signer);
         }
-        let proposer_author = peers[0];
-        let peers_ref = Arc::new(peers);
+        let proposer_author = signers[0].author();
+        let validators = ValidatorVerifier::new(author_to_public_keys);
+        let epoch_mgr = Arc::new(EpochManager::new(0, validators));
         let mut nodes = vec![];
         for signer in signers.iter().take(num_nodes) {
             let (storage, initial_data) = MockStorage::<TestPayload>::start_for_testing();
@@ -142,9 +124,9 @@ impl NodeSetup {
                 executor.clone(),
                 signer.clone(),
                 proposer_author,
-                Arc::clone(&peers_ref),
                 storage,
                 initial_data,
+                Arc::clone(&epoch_mgr),
             ));
         }
         nodes
@@ -153,11 +135,11 @@ impl NodeSetup {
     fn new(
         playground: &mut NetworkPlayground,
         executor: TaskExecutor,
-        signer: ValidatorSigner<Ed25519PrivateKey>,
+        signer: ValidatorSigner,
         proposer_author: Author,
-        peers: Arc<Vec<Author>>,
         storage: Arc<MockStorage<TestPayload>>,
         initial_data: RecoveryData<TestPayload>,
+        epoch_mgr: Arc<EpochManager>,
     ) -> Self {
         let (network_reqs_tx, network_reqs_rx) = channel::new_test(8);
         let (consensus_tx, consensus_rx) = channel::new_test(8);
@@ -166,14 +148,12 @@ impl NodeSetup {
         let author = signer.author();
 
         playground.add_node(author, consensus_tx, network_reqs_rx);
-        let validator = ValidatorVerifier::new_single(signer.author(), signer.public_key());
 
         let network = ConsensusNetworkImpl::new(
             signer.author(),
             network_sender,
             network_events,
-            Arc::clone(&peers),
-            Arc::new(validator),
+            Arc::clone(&epoch_mgr),
         );
         let consensus_state = initial_data.state();
 
@@ -188,16 +168,15 @@ impl NodeSetup {
         );
         let safety_rules = SafetyRules::new(consensus_state);
 
-        let (pacemaker, new_rounds_receiver) = Self::create_pacemaker(time_service.clone());
+        let pacemaker = Self::create_pacemaker(time_service.clone());
 
         let proposer_election = Self::create_proposer_election(proposer_author);
-        let (commit_cb_sender, commit_cb_receiver) =
-            mpsc::unbounded::<LedgerInfoWithSignatures<Ed25519Signature>>();
-        let event_processor = EventProcessor::new(
+        let (commit_cb_sender, _commit_cb_receiver) = mpsc::unbounded::<LedgerInfoWithSignatures>();
+        let mut event_processor = EventProcessor::new(
             author,
             Arc::clone(&block_store),
             pacemaker,
-            Arc::clone(&proposer_election),
+            proposer_election,
             proposal_generator,
             safety_rules,
             Arc::new(MockStateComputer::new(commit_cb_sender)),
@@ -206,17 +185,17 @@ impl NodeSetup {
             storage.clone(),
             time_service,
             true,
+            Arc::clone(&epoch_mgr),
         );
+        block_on(event_processor.start());
         Self {
             author,
             block_store,
             event_processor,
-            new_rounds_receiver,
             storage,
             signer,
             proposer_author,
-            peers,
-            commit_cb_receiver,
+            epoch_mgr,
         }
     }
 
@@ -230,9 +209,9 @@ impl NodeSetup {
             executor,
             self.signer,
             self.proposer_author,
-            self.peers,
             self.storage,
             recover_data,
+            self.epoch_mgr,
         )
     }
 }
@@ -522,18 +501,19 @@ fn process_new_round_msg_test() {
 
     // As the static proposer processes the new round message it should learn about
     // block_0_quorum_cert at round 1.
-    block_on(static_proposer.event_processor.process_remote_timeout_msg(
-        TimeoutMsg::new(
-            SyncInfo::new(
-                block_0_quorum_cert,
-                QuorumCert::certificate_for_genesis(),
-                None,
-            ),
-            PacemakerTimeout::new(2, &non_proposer.signer, None),
-            &non_proposer.signer,
-        ),
-        2,
-    ));
+    block_on(
+        static_proposer
+            .event_processor
+            .process_remote_timeout_msg(TimeoutMsg::new(
+                SyncInfo::new(
+                    block_0_quorum_cert,
+                    QuorumCert::certificate_for_genesis(),
+                    None,
+                ),
+                PacemakerTimeout::new(2, &non_proposer.signer, None),
+                &non_proposer.signer,
+            )),
+    );
     assert_eq!(
         static_proposer
             .block_store
@@ -676,15 +656,12 @@ fn process_votes_basic_test() {
         node.block_store.signer(),
     );
     block_on(async move {
-        // This is 'kick off' event from pacemaker initialization
-        let new_round_event = node.new_rounds_receiver.next().await.unwrap();
-        assert_eq!(new_round_event.reason, NewRoundReason::QCReady);
-        assert_eq!(new_round_event.round, 1);
-        node.event_processor.process_vote(vote_msg, 1).await;
-        let new_round_event = node.new_rounds_receiver.next().await.unwrap();
-        // This is event from processing qc for round 1
-        assert_eq!(new_round_event.reason, NewRoundReason::QCReady);
-        assert_eq!(new_round_event.round, 2);
+        node.event_processor.process_vote(vote_msg).await;
+        // The new QC is aggregated
+        assert_eq!(
+            node.block_store.highest_quorum_cert().certified_block_id(),
+            a1.id()
+        );
     });
     block_on(runtime.shutdown_now().compat()).unwrap();
 }

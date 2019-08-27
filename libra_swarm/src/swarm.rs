@@ -7,10 +7,10 @@ use crate::{
 };
 use config::config::{NodeConfig, RoleType};
 use config_builder::swarm_config::{LibraSwarmTopology, SwarmConfig, SwarmConfigBuilder};
+use crypto::{ed25519::*, test_utils::KeyPair};
 use debug_interface::NodeDebugClient;
 use failure::prelude::*;
 use logger::prelude::*;
-use nextgen_crypto::{ed25519::*, test_utils::KeyPair};
 use std::{
     collections::HashMap,
     env,
@@ -63,7 +63,7 @@ impl LibraNode {
         disable_logging: bool,
         tee_logs: bool,
     ) -> Result<Self> {
-        let peer_id = config.base.peer_id.clone();
+        let peer_id = config.network.peer_id.clone();
         let log = logdir.join(format!("{}.log", SwarmConfig::get_alias(&config)));
         let log_file = File::create(&log)?;
         let mut node_command = Command::new(utils::get_bin(LIBRA_NODE_BIN));
@@ -343,7 +343,7 @@ impl LibraSwarm {
                 tee_logs,
             )
             .unwrap();
-            match node_config.base.get_role() {
+            match (&node_config.network.role).into() {
                 RoleType::Validator => {
                     swarm.validator_nodes.insert(node.peer_id(), node);
                 }
@@ -562,7 +562,7 @@ impl LibraSwarm {
             .config
             .get_configs()
             .iter()
-            .find(|(_path, config)| config.base.peer_id == peer_id)
+            .find(|(_path, config)| config.network.peer_id == peer_id)
             .expect(
                 &format!(
                     "PeerId {} not found in any of the admission control service ports.",

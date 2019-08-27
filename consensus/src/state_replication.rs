@@ -6,11 +6,10 @@ use canonical_serialization::{CanonicalSerialize, CanonicalSerializer};
 use crypto::{hash::ACCUMULATOR_PLACEHOLDER_HASH, HashValue};
 use failure::Result;
 use futures::Future;
-use nextgen_crypto::ed25519::*;
 use serde::{Deserialize, Serialize};
 use std::{pin::Pin, sync::Arc};
 use types::{
-    ledger_info::LedgerInfoWithSignatures, transaction::Version, validator_set::ValidatorSet,
+    crypto_proxies::LedgerInfoWithSignatures, transaction::Version, validator_set::ValidatorSet,
 };
 
 /// A structure that specifies the result of the execution.
@@ -107,7 +106,7 @@ pub trait StateComputer: Send + Sync {
     /// Send a successful commit. A future is fulfilled when the state is finalized.
     fn commit(
         &self,
-        commit: LedgerInfoWithSignatures<Ed25519Signature>,
+        commit: LedgerInfoWithSignatures,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 
     fn sync_to(&self, commit: QuorumCert) -> Pin<Box<dyn Future<Output = Result<bool>> + Send>>;

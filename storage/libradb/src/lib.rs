@@ -40,16 +40,15 @@ use crate::{
     system_store::SystemStore,
     transaction_store::TransactionStore,
 };
-use crypto::{hash::CryptoHash, HashValue};
+use crypto::{ed25519::*, hash::CryptoHash, HashValue};
 use failure::prelude::*;
 use itertools::{izip, zip_eq};
 use lazy_static::lazy_static;
 use logger::prelude::*;
 use metrics::OpMetrics;
-use nextgen_crypto::ed25519::*;
 use schemadb::{ColumnFamilyOptions, ColumnFamilyOptionsMap, DB, DEFAULT_CF_NAME};
 use std::{convert::TryInto, iter::Iterator, path::Path, sync::Arc, time::Instant};
-use storage_proto::ExecutorStartupInfo;
+use storage_proto::StartupInfo;
 use types::{
     access_path::AccessPath,
     account_address::AccountAddress,
@@ -95,7 +94,7 @@ pub struct LibraDB {
 
 impl LibraDB {
     /// Config parameter for the pruner.
-    const NUM_HISTORICAL_VERSIONS_TO_KEEP: u64 = 1_000_000;
+    const NUM_HISTORICAL_VERSIONS_TO_KEEP: u64 = u64::max_value();
 
     /// This creates an empty LibraDB instance on disk or opens one if it already exists.
     pub fn new<P: AsRef<Path> + Clone>(db_root_path: P) -> Self {
@@ -209,6 +208,7 @@ impl LibraDB {
         };
         let event_key = account_resource
             .get_event_handle_by_query_path(query_path)?
+            .key()
             .as_access_path()?;
         let cursor = if get_latest {
             // Caller wants the latest, figure out the latest seq_num.
@@ -541,12 +541,12 @@ impl LibraDB {
         ))
     }
 
-    // =========================== Execution Internal APIs ========================================
+    // =========================== Libra Core Internal APIs ========================================
 
     /// Gets an account state by account address, out of the ledger state indicated by the state
     /// Merkle tree root hash.
     ///
-    /// This is used by the executor module internally.
+    /// This is used by libra core (executor) internally.
     pub fn get_account_state_with_proof_by_version(
         &self,
         address: AccountAddress,
@@ -556,10 +556,11 @@ impl LibraDB {
             .get_account_state_with_proof_by_version(address, version)
     }
 
-    /// Gets information needed from storage during the startup of the executor module.
+    /// Gets information needed from storage during the startup of the executor or state
+    /// synchronizer module.
     ///
-    /// This is used by the executor module internally.
-    pub fn get_executor_startup_info(&self) -> Result<Option<ExecutorStartupInfo>> {
+    /// This is used by the libra core (executor, state synchronizer) internally.
+    pub fn get_startup_info(&self) -> Result<Option<StartupInfo>> {
         // Get the latest ledger info. Return None if not bootstrapped.
         let ledger_info_with_sigs = match self.ledger_store.get_latest_ledger_info_option() {
             Some(x) => x,
@@ -575,7 +576,7 @@ impl LibraDB {
             .ledger_store
             .get_ledger_frozen_subtree_hashes(latest_version)?;
 
-        Ok(Some(ExecutorStartupInfo {
+        Ok(Some(StartupInfo {
             ledger_info,
             latest_version,
             account_state_root_hash,

@@ -5,6 +5,7 @@ use crate::{
     account_address::AccountAddress,
     byte_array::ByteArray,
     proto::transaction::{TransactionArgument as ProtoArgument, TransactionArgument_ArgType},
+    transaction::transaction_argument::TransactionArgument,
 };
 use byteorder::{LittleEndian, WriteBytesExt};
 use canonical_serialization::{
@@ -12,7 +13,6 @@ use canonical_serialization::{
 };
 use failure::prelude::*;
 use proto_conv::{FromProto, IntoProto};
-use protobuf::ProtobufEnum;
 use serde::{Deserialize, Serialize};
 use std::{convert::TryFrom, fmt};
 
@@ -162,76 +162,5 @@ impl CanonicalDeserialize for Program {
         let modules: Vec<Vec<u8>> = deserializer.decode_vec()?;
 
         Ok(Program::new(code, modules, args))
-    }
-}
-
-#[derive(Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
-pub enum TransactionArgument {
-    U64(u64),
-    Address(AccountAddress),
-    ByteArray(ByteArray),
-    String(String),
-}
-
-impl fmt::Debug for TransactionArgument {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TransactionArgument::U64(value) => write!(f, "{{U64: {}}}", value),
-            TransactionArgument::Address(address) => write!(f, "{{ADDRESS: {:?}}}", address),
-            TransactionArgument::String(string) => write!(f, "{{STRING: {}}}", string),
-            TransactionArgument::ByteArray(byte_array) => {
-                write!(f, "{{ByteArray: 0x{}}}", byte_array)
-            }
-        }
-    }
-}
-
-impl CanonicalSerialize for TransactionArgument {
-    fn serialize(&self, serializer: &mut impl CanonicalSerializer) -> Result<()> {
-        match self {
-            TransactionArgument::U64(value) => {
-                serializer.encode_u32(TransactionArgument_ArgType::U64 as u32)?;
-                serializer.encode_u64(*value)?;
-            }
-            TransactionArgument::Address(address) => {
-                serializer.encode_u32(TransactionArgument_ArgType::ADDRESS as u32)?;
-                serializer.encode_struct(address)?;
-            }
-            TransactionArgument::String(string) => {
-                serializer.encode_u32(TransactionArgument_ArgType::STRING as u32)?;
-                serializer.encode_string(string)?;
-            }
-            TransactionArgument::ByteArray(byte_array) => {
-                serializer.encode_u32(TransactionArgument_ArgType::BYTEARRAY as u32)?;
-                serializer.encode_struct(byte_array)?;
-            }
-        }
-
-        Ok(())
-    }
-}
-
-impl CanonicalDeserialize for TransactionArgument {
-    fn deserialize(deserializer: &mut impl CanonicalDeserializer) -> Result<Self> {
-        let decoded_value = deserializer.decode_u32()? as i32;
-        let arg_type = TransactionArgument_ArgType::from_i32(decoded_value);
-        match arg_type {
-            Some(TransactionArgument_ArgType::U64) => {
-                Ok(TransactionArgument::U64(deserializer.decode_u64()?))
-            }
-            Some(TransactionArgument_ArgType::ADDRESS) => {
-                Ok(TransactionArgument::Address(deserializer.decode_struct()?))
-            }
-            Some(TransactionArgument_ArgType::STRING) => {
-                Ok(TransactionArgument::String(deserializer.decode_string()?))
-            }
-            Some(TransactionArgument_ArgType::BYTEARRAY) => Ok(TransactionArgument::ByteArray(
-                deserializer.decode_struct()?,
-            )),
-            None => Err(format_err!(
-                "ParseError: Unable to decode TransactionArgument_ArgType, found {}",
-                decoded_value
-            )),
-        }
     }
 }

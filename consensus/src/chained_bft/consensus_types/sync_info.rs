@@ -2,7 +2,6 @@ use crate::chained_bft::consensus_types::{
     quorum_cert::QuorumCert, timeout_msg::PacemakerTimeoutCertificate,
 };
 use network;
-use nextgen_crypto::ed25519::*;
 
 use crate::chained_bft::{
     common::Round, consensus_types::timeout_msg::PacemakerTimeoutCertificateVerificationError,
@@ -11,7 +10,7 @@ use crate::chained_bft::{
 use proto_conv::{FromProto, IntoProto};
 use serde::{Deserialize, Serialize};
 use std::fmt::{Display, Formatter};
-use types::validator_verifier::ValidatorVerifier;
+use types::crypto_proxies::ValidatorVerifier;
 
 #[derive(Deserialize, Serialize, Clone, Debug, Eq, PartialEq)]
 /// This struct describes basic synchronization metadata.
@@ -106,10 +105,7 @@ impl SyncInfo {
         std::cmp::max(self.hqc_round(), self.htc_round())
     }
 
-    pub fn verify(
-        &self,
-        validator: &ValidatorVerifier<Ed25519PublicKey>,
-    ) -> Result<(), SyncInfoVerificationError> {
+    pub fn verify(&self, validator: &ValidatorVerifier) -> Result<(), SyncInfoVerificationError> {
         self.highest_quorum_cert.verify(validator)?;
         self.highest_ledger_info.verify(validator)?;
         if let Some(tc) = &self.highest_timeout_cert {

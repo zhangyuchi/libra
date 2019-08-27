@@ -15,7 +15,6 @@ use canonical_serialization::CanonicalSerialize;
 use crypto::HashValue;
 use logger::prelude::*;
 use mirai_annotations::checked_verify_eq;
-use nextgen_crypto::ed25519::*;
 use serde::Serialize;
 use std::{
     collections::{
@@ -27,7 +26,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use types::ledger_info::LedgerInfoWithSignatures;
+use types::crypto_proxies::LedgerInfoWithSignatures;
 
 /// This structure maintains a consistent block tree of parent and children links. Blocks contain
 /// parent links and are immutable.  For all parent links, a child link exists. This structure
@@ -62,7 +61,7 @@ pub struct BlockTree<T> {
     /// The vote digest is a hash that covers both the proposal id and the state id.
     /// Thus, the structure of `id_to_votes` is as follows:
     /// HashMap<proposed_block_id, HashMap<vote_digest, LedgerInfoWithSignatures>>
-    id_to_votes: HashMap<HashValue, HashMap<HashValue, LedgerInfoWithSignatures<Ed25519Signature>>>,
+    id_to_votes: HashMap<HashValue, HashMap<HashValue, LedgerInfoWithSignatures>>,
     /// Map of block id to its completed quorum certificate (2f + 1 votes)
     id_to_quorum_cert: HashMap<HashValue, Arc<QuorumCert>>,
     /// To keep the IDs of the elements that have been pruned from the tree but not cleaned up yet.
@@ -275,7 +274,7 @@ where
         if li_with_sig.signatures().contains_key(&author) {
             return VoteReceptionResult::DuplicateVote;
         }
-        li_with_sig.add_signature(author, vote_msg.signature().clone());
+        vote_msg.signature().clone().add_to_li(author, li_with_sig);
 
         let num_votes = li_with_sig.signatures().len();
         if num_votes >= min_votes_for_qc {
@@ -295,7 +294,7 @@ where
                 if let Some(time_to_qc) = duration_since_epoch()
                     .checked_sub(Duration::from_micros(block.timestamp_usecs()))
                 {
-                    counters::CREATION_TO_QC_MS.observe(time_to_qc.as_millis() as f64);
+                    counters::CREATION_TO_QC_S.observe_duration(time_to_qc);
                 }
             }
             return VoteReceptionResult::NewQuorumCertificate(Arc::new(quorum_cert));

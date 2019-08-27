@@ -74,7 +74,7 @@ use failure::prelude::*;
 use nibble::{skip_common_prefix, NibbleIterator, NibblePath};
 use node_type::{Child, Children, InternalNode, LeafNode, Node, NodeKey};
 use proptest_derive::Arbitrary;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use tree_cache::TreeCache;
 use types::{account_state_blob::AccountStateBlob, proof::SparseMerkleProof, transaction::Version};
 
@@ -89,9 +89,9 @@ pub trait TreeReader {
 }
 
 /// Node batch that will be written into db atomically with other batches.
-pub type NodeBatch = HashMap<NodeKey, Node>;
+pub type NodeBatch = BTreeMap<NodeKey, Node>;
 /// [`RetireNodeIndex`] batch that will be written into db atomically with other batches.
-pub type StaleNodeIndexBatch = HashSet<StaleNodeIndex>;
+pub type StaleNodeIndexBatch = BTreeSet<StaleNodeIndex>;
 
 /// Indicates a node becomes stale since `stale_since_version`.
 #[derive(Arbitrary, Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -130,19 +130,20 @@ where
     }
 
     /// This is a convenient function that calls
-    /// [`put_blob_set`](JellyfishMerkleTree::put_blob_set) with a single `keyed_blob_set`.
+    /// [`put_blob_sets`](JellyfishMerkleTree::put_blob_sets) with a single `keyed_blob_set`.
+    #[cfg(test)]
     pub fn put_blob_set(
         &self,
         blob_set: Vec<(HashValue, AccountStateBlob)>,
         version: Version,
     ) -> Result<(HashValue, TreeUpdateBatch)> {
-        let (mut root_hashes, tree_update_batch) = self.put_blob_sets(vec![blob_set], version)?;
-        let root_hash = root_hashes.pop().expect("root hash must exist");
-        assert!(
-            root_hashes.is_empty(),
-            "root_hashes can only have 1 root hash inside"
+        let (root_hashes, tree_update_batch) = self.put_blob_sets(vec![blob_set], version)?;
+        assert_eq!(
+            root_hashes.len(),
+            1,
+            "root_hashes must consist of a single value.",
         );
-        Ok((root_hash, tree_update_batch))
+        Ok((root_hashes[0], tree_update_batch))
     }
 
     /// Returns the new nodes and account state blobs in a batch after applying `blob_set`. For

@@ -13,9 +13,20 @@ pub fn stack_has(state: &AbstractState, index: usize, token: Option<SignatureTok
     }
 }
 
+/// Determine whether two tokens on the stack have the same type
 pub fn stack_has_polymorphic_eq(state: &AbstractState, index1: usize, index2: usize) -> bool {
     if stack_has(state, index2, None) {
         return state.stack_peek(index1) == state.stack_peek(index2);
+    }
+    false
+}
+
+/// Determine whether a token on the stack and a token in the locals have the same type
+pub fn stack_local_polymorphic_eq(state: &AbstractState, index1: usize, index2: usize) -> bool {
+    if stack_has(state, index1, None) {
+        if let Some((token, _)) = state.get_local(index2) {
+            return state.stack_peek(index1) == Some(token.clone());
+        }
     }
     false
 }
@@ -63,15 +74,20 @@ pub fn stack_push_local_move(state: &AbstractState, index: u8) -> AbstractState 
 }
 
 /// Push a reference to the local at `index` to the stack.
-pub fn stack_push_local_borrow(state: &AbstractState, index: u8) -> AbstractState {
+pub fn stack_push_local_borrow(state: &AbstractState, mut_: bool, index: u8) -> AbstractState {
     // TODO: Change to precondition once MIRAI is integrated
     assert!(
         state.get_local(index as usize).is_some(),
         "Failed to borrow local to stack"
     );
     let state = state.clone();
-    let (token, _) = state.get_local(index as usize).unwrap().clone();
-    stack_push(&state, SignatureToken::MutableReference(Box::new(token)))
+    let (inner_token, _) = state.get_local(index as usize).unwrap().clone();
+    let ref_token = if mut_ {
+        SignatureToken::MutableReference(Box::new(inner_token))
+    } else {
+        SignatureToken::Reference(Box::new(inner_token))
+    };
+    stack_push(&state, ref_token)
 }
 
 /// Pop an element from the stack and insert it into the locals at `index`
@@ -96,10 +112,20 @@ macro_rules! state_stack_has {
     };
 }
 
+/// Wrapper for determining whether two tokens on the stack have the same type
 #[macro_export]
 macro_rules! state_stack_has_polymorphic_eq {
     ($e1: expr, $e2: expr) => {
         Box::new(move |state| stack_has_polymorphic_eq(state, $e1, $e2))
+    };
+}
+
+/// Wrapper for determining whether a token on the stack and a token in the locals
+/// have the same type
+#[macro_export]
+macro_rules! state_stack_local_polymorphic_eq {
+    ($e1: expr, $e2: expr) => {
+        Box::new(move |state| stack_local_polymorphic_eq(state, $e1, $e2))
     };
 }
 
@@ -143,8 +169,8 @@ macro_rules! state_stack_push_local_move {
 /// to be given.
 #[macro_export]
 macro_rules! state_stack_push_local_borrow {
-    ($e: expr) => {
-        Box::new(move |state| stack_push_local_borrow(state, $e))
+    ($mut_: expr, $e: expr) => {
+        Box::new(move |state| stack_push_local_borrow(state, $mut_, $e))
     };
 }
 

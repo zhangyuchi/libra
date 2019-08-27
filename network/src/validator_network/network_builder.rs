@@ -15,19 +15,17 @@ use crate::{
         identity::Identity,
         rpc::Rpc,
     },
-    transport::{
-        build_memory_noise_transport, build_memory_transport, build_tcp_noise_transport,
-        build_tcp_transport,
-    },
+    transport::*,
     ProtocolId,
 };
 use channel;
-use futures::{compat::Compat01As03, FutureExt, StreamExt, TryFutureExt};
-use netcore::{multiplexing::StreamMultiplexer, transport::boxed::BoxedTransport};
-use nextgen_crypto::{
+use config::config::RoleType;
+use crypto::{
     ed25519::*,
     x25519::{X25519StaticPrivateKey, X25519StaticPublicKey},
 };
+use futures::{compat::Compat01As03, FutureExt, StreamExt, TryFutureExt};
+use netcore::{multiplexing::StreamMultiplexer, transport::boxed::BoxedTransport};
 use parity_multiaddr::Multiaddr;
 use std::{
     collections::HashMap,
@@ -60,6 +58,7 @@ pub enum TransportType {
     MemoryNoise,
     Tcp,
     TcpNoise,
+    PermissionlessTcpNoise,
 }
 
 /// Build Network module with custom configuration values.
@@ -71,6 +70,7 @@ pub struct NetworkBuilder {
     executor: TaskExecutor,
     peer_id: PeerId,
     addr: Multiaddr,
+    role: RoleType,
     advertised_address: Option<Multiaddr>,
     seed_peers: HashMap<PeerId, PeerInfo>,
     trusted_peers: Arc<RwLock<HashMap<PeerId, NetworkPublicKeys>>>,
@@ -96,11 +96,17 @@ pub struct NetworkBuilder {
 
 impl NetworkBuilder {
     /// Return a new NetworkBuilder initialized with default configuration values.
-    pub fn new(executor: TaskExecutor, peer_id: PeerId, addr: Multiaddr) -> NetworkBuilder {
+    pub fn new(
+        executor: TaskExecutor,
+        peer_id: PeerId,
+        addr: Multiaddr,
+        role: RoleType,
+    ) -> NetworkBuilder {
         NetworkBuilder {
             executor,
             peer_id,
             addr,
+            role,
             advertised_address: None,
             seed_peers: HashMap::new(),
             trusted_peers: Arc::new(RwLock::new(HashMap::new())),
@@ -293,7 +299,7 @@ impl NetworkBuilder {
     /// Create the configured `NetworkBuilder`
     /// Return the constructed Mempool and Consensus Sender+Events
     pub fn build(&mut self) -> (Multiaddr, Box<dyn LibraNetworkProvider>) {
-        let identity = Identity::new(self.peer_id, self.supported_protocols());
+        let identity = Identity::new(self.peer_id, self.supported_protocols(), self.role.clone());
         // Build network based on the transport type
         let own_identity_keys = self.identity_keys.take().expect("Identity keys not set");
         let trusted_peers = self.trusted_peers.clone();
@@ -310,6 +316,9 @@ impl NetworkBuilder {
                 own_identity_keys,
                 trusted_peers,
             )),
+            TransportType::PermissionlessTcpNoise => self.build_with_transport(
+                build_permissionless_tcp_noise_transport(identity, own_identity_keys),
+            ),
         }
     }
 

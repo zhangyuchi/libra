@@ -6,7 +6,7 @@ use crate::{
 };
 use config::config::RoleType;
 use config_builder::util::get_test_config;
-use crypto::HashValue;
+use crypto::{ed25519::*, test_utils::TEST_SEED, traits::Genesis, x25519, HashValue, SigningKey};
 use execution_proto::proto::execution::{ExecuteChunkRequest, ExecuteChunkResponse};
 use failure::{prelude::*, Result};
 use futures::{
@@ -22,7 +22,6 @@ use network::{
     },
     NetworkPublicKeys, ProtocolId,
 };
-use nextgen_crypto::{ed25519::*, test_utils::TEST_SEED, traits::Genesis, x25519, SigningKey};
 use parity_multiaddr::Multiaddr;
 use proto_conv::{FromProto, IntoProto};
 use rand::{rngs::StdRng, SeedableRng};
@@ -101,7 +100,7 @@ impl MockExecutorProxy {
                 txn_info,
             )],
             None,
-            Some(0),
+            Some(version + 1),
             Some(accumulator_proof),
             None,
         );
@@ -118,6 +117,11 @@ impl ExecutorProxyTrait for MockExecutorProxy {
         let version = self.version.load(Ordering::Relaxed);
         let response = Self::mock_ledger_info(self.peer_id, version);
         async move { Ok(response) }.boxed()
+    }
+
+    fn get_latest_version(&self) -> Pin<Box<dyn Future<Output = Result<u64>> + Send>> {
+        let version = self.version.load(Ordering::Relaxed);
+        async move { Ok(version) }.boxed()
     }
 
     fn execute_chunk(
@@ -188,51 +192,58 @@ impl SynchronizerEnv {
         .into_iter()
         .collect();
 
-        let (listener_addr, mut network_provider) =
-            NetworkBuilder::new(runtime.executor(), peers[1], addr.clone())
-                .signing_keys((b_signing_private_key, b_signing_public_key))
-                .identity_keys((b_identity_private_key, b_identity_public_key))
-                .trusted_peers(trusted_peers.clone())
-                .transport(TransportType::Memory)
-                .direct_send_protocols(protocols.clone())
-                .build();
+        let (listener_addr, mut network_provider) = NetworkBuilder::new(
+            runtime.executor(),
+            peers[1],
+            addr.clone(),
+            RoleType::Validator,
+        )
+        .signing_keys((b_signing_private_key, b_signing_public_key))
+        .identity_keys((b_identity_private_key, b_identity_public_key))
+        .trusted_peers(trusted_peers.clone())
+        .transport(TransportType::Memory)
+        .direct_send_protocols(protocols.clone())
+        .build();
         let (sender_b, events_b) = network_provider.add_state_synchronizer(protocols.clone());
         runtime
             .executor()
             .spawn(network_provider.start().unit_error().compat());
 
-        let (_dialer_addr, mut network_provider) =
-            NetworkBuilder::new(runtime.executor(), peers[0], addr.clone())
-                .transport(TransportType::Memory)
-                .signing_keys((a_signing_private_key, a_signing_public_key))
-                .identity_keys((a_identity_private_key, a_identity_public_key))
-                .trusted_peers(trusted_peers.clone())
-                .seed_peers([(peers[1], vec![listener_addr])].iter().cloned().collect())
-                .direct_send_protocols(protocols.clone())
-                .build();
+        let (_dialer_addr, mut network_provider) = NetworkBuilder::new(
+            runtime.executor(),
+            peers[0],
+            addr.clone(),
+            RoleType::Validator,
+        )
+        .transport(TransportType::Memory)
+        .signing_keys((a_signing_private_key, a_signing_public_key))
+        .identity_keys((a_identity_private_key, a_identity_public_key))
+        .trusted_peers(trusted_peers.clone())
+        .seed_peers([(peers[1], vec![listener_addr])].iter().cloned().collect())
+        .direct_send_protocols(protocols.clone())
+        .build();
         let (sender_a, events_a) = network_provider.add_state_synchronizer(protocols);
         runtime
             .executor()
             .spawn(network_provider.start().unit_error().compat());
 
-        let default_handler = Box::new(|resp| -> Result<GetChunkResponse> { Ok(resp) });
         // create synchronizers
         let mut config = get_test_config().0;
         if role == RoleType::FullNode {
-            config.base.role = "full_node".to_string();
+            config.network.role = "full_node".to_string();
         }
         let synchronizers: Vec<StateSynchronizer> = vec![
             StateSynchronizer::bootstrap_with_executor_proxy(
-                sender_a,
-                events_a,
+                vec![(sender_a, events_a)],
                 &config,
-                MockExecutorProxy::new(peers[0], default_handler),
+                MockExecutorProxy::new(peers[0], Self::default_handler()),
+                vec![peers[1]],
             ),
             StateSynchronizer::bootstrap_with_executor_proxy(
-                sender_b,
-                events_b,
+                vec![(sender_b, events_b)],
                 &get_test_config().0,
                 MockExecutorProxy::new(peers[1], handler),
+                vec![],
             ),
         ];
         let clients = synchronizers.iter().map(|s| s.create_client()).collect();
@@ -245,9 +256,17 @@ impl SynchronizerEnv {
         }
     }
 
+    fn default_handler() -> MockRpcHandler {
+        Box::new(|resp| -> Result<GetChunkResponse> { Ok(resp) })
+    }
+
     fn sync_to(&self, peer_id: usize, version: u64) -> bool {
         let target = MockExecutorProxy::mock_ledger_info(self.peers[1], version);
         block_on(self.clients[peer_id].sync_to(target)).unwrap()
+    }
+
+    fn commit(&self, peer_id: usize, version: u64) {
+        block_on(self.clients[peer_id].commit(version)).unwrap();
     }
 
     fn wait_for_version(&self, peer_id: usize, target_version: u64) -> bool {
@@ -265,8 +284,7 @@ impl SynchronizerEnv {
 
 #[test]
 fn test_basic_catch_up() {
-    let handler = Box::new(|resp| -> Result<GetChunkResponse> { Ok(resp) });
-    let env = SynchronizerEnv::new(handler, RoleType::Validator);
+    let env = SynchronizerEnv::new(SynchronizerEnv::default_handler(), RoleType::Validator);
 
     // test small sequential syncs
     for version in 1..5 {
@@ -295,15 +313,12 @@ fn test_flaky_peer_sync() {
 
 #[test]
 fn test_full_node() {
-    let committed_version = 10;
-    let handler = Box::new(move |resp: GetChunkResponse| -> Result<GetChunkResponse> {
-        let v = resp.get_ledger_info_with_sigs().get_ledger_info().version;
-        if v <= committed_version {
-            Ok(resp)
-        } else {
-            bail!("no new data");
-        }
-    });
-    let env = SynchronizerEnv::new(handler, RoleType::FullNode);
+    let env = SynchronizerEnv::new(SynchronizerEnv::default_handler(), RoleType::FullNode);
+    env.commit(1, 10);
+    // first sync should be fulfilled immediately after peer discovery
     assert!(env.wait_for_version(0, 10));
+    env.commit(1, 20);
+    // second sync will be done via long polling cause first node should send new request
+    // after receiving first chunk immediately
+    assert!(env.wait_for_version(0, 20));
 }

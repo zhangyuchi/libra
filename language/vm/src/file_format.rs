@@ -239,8 +239,8 @@ pub struct StructHandle {
     ///
     /// If `is_nominal_resource` is true, it is a *nominal resource*
     pub is_nominal_resource: bool,
-    /// The type parameters (identified by their index into the vec) and their kind constraints
-    pub type_parameters: Vec<Kind>,
+    /// The type formals (identified by their index into the vec) and their kind constraints
+    pub type_formals: Vec<Kind>,
 }
 
 /// A `FunctionHandle` is a reference to a function. It is composed by a
@@ -390,8 +390,8 @@ pub struct FunctionSignature {
         proptest(strategy = "vec(any::<SignatureToken>(), 0..=params)")
     )]
     pub arg_types: Vec<SignatureToken>,
-    /// The type parameters (identified by their index into the vec) and their kind constraints
-    pub type_parameters: Vec<Kind>,
+    /// The type formals (identified by their index into the vec) and their kind constraints
+    pub type_formals: Vec<Kind>,
 }
 
 /// A `LocalsSignature` is the list of locals used by a function.
@@ -471,7 +471,7 @@ pub enum SignatureToken {
     Struct(StructHandleIndex, Vec<SignatureToken>),
     /// Reference to a type.
     Reference(Box<SignatureToken>),
-    /// Immutable reference to a type.
+    /// Mutable reference to a type.
     MutableReference(Box<SignatureToken>),
     /// Type parameter.
     TypeParameter(TypeParameterIndex),
@@ -821,36 +821,43 @@ pub enum Bytecode {
     ///
     /// ```..., value, reference_value -> ...```
     WriteRef,
-    /// Release a reference. The reference will become invalid and cannot be used after.
-    ///
-    /// All references must be consumed and ReleaseRef is a way to release references not
-    /// consumed by other opcodes.
-    ///
-    /// Stack transition:
-    ///
-    /// ```..., reference_value -> ...```
-    ReleaseRef,
     /// Convert a mutable reference to an immutable reference.
     ///
     /// Stack transition:
     ///
     /// ```..., reference_value -> ..., reference_value```
     FreezeRef,
-    /// Load a reference to a local identified by LocalIndex.
+    /// Load a mutable reference to a local identified by LocalIndex.
     ///
     /// The local must not be a reference.
     ///
     /// Stack transition:
     ///
     /// ```... -> ..., reference```
-    BorrowLoc(LocalIndex),
-    /// Load a reference to a field identified by `FieldDefinitionIndex`.
+    MutBorrowLoc(LocalIndex),
+    /// Load an immutable reference to a local identified by LocalIndex.
+    ///
+    /// The local must not be a reference.
+    ///
+    /// Stack transition:
+    ///
+    /// ```... -> ..., reference```
+    ImmBorrowLoc(LocalIndex),
+    /// Load a mutable reference to a field identified by `FieldDefinitionIndex`.
+    /// The top of the stack must be a mutable reference to a type that contains the field
+    /// definition.
+    ///
+    /// Stack transition:
+    ///
+    /// ```..., reference -> ..., field_reference```
+    MutBorrowField(FieldDefinitionIndex),
+    /// Load an immutable reference to a field identified by `FieldDefinitionIndex`.
     /// The top of the stack must be a reference to a type that contains the field definition.
     ///
     /// Stack transition:
     ///
     /// ```..., reference -> ..., field_reference```
-    BorrowField(FieldDefinitionIndex),
+    ImmBorrowField(FieldDefinitionIndex),
     /// Return reference to an instance of type `StructDefinitionIndex` published at the address
     /// passed as argument. Abort execution if such an object does not exist or if a reference
     /// has already been handed out.
@@ -1050,7 +1057,7 @@ pub enum Bytecode {
 /// The number of bytecode instructions.
 /// This is necessary for checking that all instructions are covered since Rust
 /// does not provide a way of determining the number of variants of an enum.
-pub const NUMBER_OF_BYTECODE_INSTRUCTIONS: usize = 52;
+pub const NUMBER_OF_BYTECODE_INSTRUCTIONS: usize = 53;
 
 impl ::std::fmt::Debug for Bytecode {
     fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
@@ -1074,10 +1081,11 @@ impl ::std::fmt::Debug for Bytecode {
             Bytecode::Unpack(a, b) => write!(f, "Unpack({}, {:?})", a, b),
             Bytecode::ReadRef => write!(f, "ReadRef"),
             Bytecode::WriteRef => write!(f, "WriteRef"),
-            Bytecode::ReleaseRef => write!(f, "ReleaseRef"),
             Bytecode::FreezeRef => write!(f, "FreezeRef"),
-            Bytecode::BorrowLoc(a) => write!(f, "BorrowLoc({})", a),
-            Bytecode::BorrowField(a) => write!(f, "BorrowField({})", a),
+            Bytecode::MutBorrowLoc(a) => write!(f, "MutBorrowLoc({})", a),
+            Bytecode::ImmBorrowLoc(a) => write!(f, "ImmBorrowLoc({})", a),
+            Bytecode::MutBorrowField(a) => write!(f, "MutBorrowField({})", a),
+            Bytecode::ImmBorrowField(a) => write!(f, "ImmBorrowField({})", a),
             Bytecode::BorrowGlobal(a, b) => write!(f, "BorrowGlobal({}, {:?})", a, b),
             Bytecode::Add => write!(f, "Add"),
             Bytecode::Sub => write!(f, "Sub"),
@@ -1147,6 +1155,12 @@ impl Bytecode {
 
     /// Return the successor offsets of this bytecode instruction.
     pub fn get_successors(pc: CodeOffset, code: &[Bytecode]) -> Vec<CodeOffset> {
+        checked_precondition!(
+            // The program counter could be added to at most twice and must remain
+            // within the bounds of the code.
+            pc <= u16::max_value() - 2 && (pc as usize) < code.len(),
+            "Program counter out of bounds"
+        );
         let bytecode = &code[pc as usize];
         let mut v = vec![];
 
@@ -1555,7 +1569,7 @@ pub fn dummy_procedure_module(code: Vec<Bytecode>) -> CompiledModule {
     module.function_signatures.push(FunctionSignature {
         arg_types: vec![],
         return_types: vec![],
-        type_parameters: vec![],
+        type_formals: vec![],
     });
     let fun_handle = FunctionHandle {
         module: ModuleHandleIndex(0),

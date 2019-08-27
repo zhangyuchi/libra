@@ -4,8 +4,10 @@
 use crate::{
     coordinator::{CoordinatorMessage, SyncCoordinator},
     executor_proxy::{ExecutorProxy, ExecutorProxyTrait},
+    PeerId,
 };
 use config::config::NodeConfig;
+use crypto::ed25519::*;
 use failure::prelude::*;
 use futures::{
     channel::{mpsc, oneshot},
@@ -13,7 +15,6 @@ use futures::{
     SinkExt,
 };
 use network::validator_network::{StateSynchronizerEvents, StateSynchronizerSender};
-use nextgen_crypto::ed25519::*;
 use std::sync::Arc;
 use tokio::runtime::{Builder, Runtime};
 use types::ledger_info::LedgerInfoWithSignatures;
@@ -26,19 +27,19 @@ pub struct StateSynchronizer {
 impl StateSynchronizer {
     /// Setup state synchronizer. spawns coordinator and downloader routines on executor
     pub fn bootstrap(
-        network_sender: StateSynchronizerSender,
-        network_events: StateSynchronizerEvents,
+        network: Vec<(StateSynchronizerSender, StateSynchronizerEvents)>,
         config: &NodeConfig,
+        peer_ids: Vec<PeerId>,
     ) -> Self {
         let executor_proxy = ExecutorProxy::new(config);
-        Self::bootstrap_with_executor_proxy(network_sender, network_events, config, executor_proxy)
+        Self::bootstrap_with_executor_proxy(network, config, executor_proxy, peer_ids)
     }
 
     pub fn bootstrap_with_executor_proxy<E: ExecutorProxyTrait + 'static>(
-        network_sender: StateSynchronizerSender,
-        network_events: StateSynchronizerEvents,
+        network: Vec<(StateSynchronizerSender, StateSynchronizerEvents)>,
         config: &NodeConfig,
         executor_proxy: E,
+        peer_ids: Vec<PeerId>,
     ) -> Self {
         let runtime = Builder::new()
             .name_prefix("state-sync-")
@@ -49,13 +50,12 @@ impl StateSynchronizer {
         let (coordinator_sender, coordinator_receiver) = mpsc::unbounded();
 
         let coordinator = SyncCoordinator::new(
-            network_sender,
-            network_events,
             coordinator_receiver,
             config,
             executor_proxy,
+            peer_ids.clone(),
         );
-        executor.spawn(coordinator.start().boxed().unit_error().compat());
+        executor.spawn(coordinator.start(network).boxed().unit_error().compat());
 
         Self {
             _runtime: runtime,

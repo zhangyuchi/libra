@@ -1,5 +1,6 @@
 use crate::LedgerInfo;
 use config::config::NodeConfig;
+use crypto::ed25519::*;
 use execution_proto::proto::{
     execution::{ExecuteChunkRequest, ExecuteChunkResponse},
     execution_grpc::ExecutionClient,
@@ -10,7 +11,6 @@ use grpc_helpers::convert_grpc_response;
 use grpcio::{ChannelBuilder, EnvBuilder};
 use logger::prelude::*;
 use network::proto::GetChunkResponse;
-use nextgen_crypto::ed25519::*;
 use proto_conv::IntoProto;
 use std::{pin::Pin, sync::Arc};
 use storage_client::{StorageRead, StorageReadServiceClient};
@@ -19,6 +19,9 @@ use types::ledger_info::LedgerInfoWithSignatures;
 /// Proxies interactions with execution and storage for state synchronization
 pub trait ExecutorProxyTrait: Sync + Send {
     /// Return the latest known version
+    fn get_latest_version(&self) -> Pin<Box<dyn Future<Output = Result<u64>> + Send>>;
+
+    /// Return the latest known ledger info
     fn get_latest_ledger_info(&self) -> Pin<Box<dyn Future<Output = Result<LedgerInfo>> + Send>>;
 
     /// Execute and commit a batch of transactions
@@ -61,6 +64,16 @@ impl ExecutorProxy {
 }
 
 impl ExecutorProxyTrait for ExecutorProxy {
+    fn get_latest_version(&self) -> Pin<Box<dyn Future<Output = Result<u64>> + Send>> {
+        let client = Arc::clone(&self.storage_client);
+        async move {
+            let resp = client.get_startup_info_async().await?;
+            resp.map(|r| r.latest_version)
+                .ok_or_else(|| format_err!("failed to fetch startup info"))
+        }
+            .boxed()
+    }
+
     fn get_latest_ledger_info(&self) -> Pin<Box<dyn Future<Output = Result<LedgerInfo>> + Send>> {
         let client = Arc::clone(&self.storage_client);
         async move { Ok(client.update_to_latest_ledger_async(0, vec![]).await?.1) }.boxed()

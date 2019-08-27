@@ -4,10 +4,9 @@
 //! This module provides mock storage clients for tests.
 
 use canonical_serialization::SimpleSerializer;
-use crypto::HashValue;
+use crypto::{ed25519::*, HashValue};
 use failure::prelude::*;
 use futures::prelude::*;
-use nextgen_crypto::ed25519::*;
 use proto_conv::{FromProto, IntoProto};
 use rand::{
     rngs::{OsRng, StdRng},
@@ -15,11 +14,11 @@ use rand::{
 };
 use std::{collections::BTreeMap, pin::Pin};
 use storage_client::StorageRead;
-use storage_proto::ExecutorStartupInfo;
+use storage_proto::StartupInfo;
 use types::{
     account_address::{AccountAddress, ADDRESS_LENGTH},
-    account_config::EventHandle,
     account_state_blob::AccountStateBlob,
+    event::EventHandle,
     get_with_proof::{RequestItem, ResponseItem},
     ledger_info::LedgerInfoWithSignatures,
     proof::SparseMerkleProof,
@@ -132,13 +131,13 @@ impl StorageRead for MockStorageReadClient {
         unimplemented!();
     }
 
-    fn get_executor_startup_info(&self) -> Result<Option<ExecutorStartupInfo>> {
+    fn get_startup_info(&self) -> Result<Option<StartupInfo>> {
         unimplemented!()
     }
 
-    fn get_executor_startup_info_async(
+    fn get_startup_info_async(
         &self,
-    ) -> Pin<Box<dyn Future<Output = Result<Option<ExecutorStartupInfo>>> + Send>> {
+    ) -> Pin<Box<dyn Future<Output = Result<Option<StartupInfo>>> + Send>> {
         unimplemented!()
     }
 }

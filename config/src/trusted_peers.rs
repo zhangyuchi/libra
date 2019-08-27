@@ -1,7 +1,7 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use nextgen_crypto::{
+use crypto::{
     ed25519::{compat, *},
     traits::ValidKeyStringExt,
     x25519::{self, X25519StaticPrivateKey, X25519StaticPublicKey},
@@ -9,9 +9,10 @@ use nextgen_crypto::{
 use rand::{rngs::StdRng, SeedableRng};
 use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     convert::TryFrom,
     fs::File,
+    hash::BuildHasher,
     io::{Read, Write},
     path::Path,
 };
@@ -115,7 +116,20 @@ where
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TrustedPeersConfig {
     #[serde(flatten)]
+    #[serde(serialize_with = "serialize_ordered_map")]
     pub peers: HashMap<String, TrustedPeer>,
+}
+
+pub fn serialize_ordered_map<S, H>(
+    value: &HashMap<String, TrustedPeer, H>,
+    serializer: S,
+) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+    H: BuildHasher,
+{
+    let ordered: BTreeMap<_, _> = value.iter().collect();
+    ordered.serialize(serializer)
 }
 
 impl TrustedPeersConfig {
