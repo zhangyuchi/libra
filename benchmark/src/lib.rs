@@ -2,18 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use admission_control_proto::proto::{
+    admission_control::AdmissionControlClient,
     admission_control::SubmitTransactionResponse as ProtoSubmitTransactionResponse,
-    admission_control_grpc::AdmissionControlClient,
 };
 use client::{AccountData, AccountStatus};
-use crypto::{ed25519::*, test_utils::KeyPair};
 use generate_keypair::load_key_from_file;
 use lazy_static::lazy_static;
-use logger::prelude::*;
-use metrics::OpMetrics;
+use libra_crypto::{ed25519::*, test_utils::KeyPair};
+use libra_logger::prelude::*;
+use libra_metrics::OpMetrics;
+use libra_types::{account_address::AccountAddress, account_config::association_address};
 use rand::Rng;
 use std::{collections::HashMap, convert::TryInto, sync::Arc, thread, time};
-use types::{account_address::AccountAddress, account_config::association_address};
 
 pub mod bin_utils;
 pub mod cli_opt;
@@ -42,10 +42,10 @@ lazy_static! {
 ///    submit_requests_and_wait_txns_committed, measure_txn_throughput.
 /// Metrics reported include:
 /// * Counters related to:
-///   * TXN generation: requested_txns, created_txns, sign_failed_txns;
+///   * TXN generation: create_txn_request.(success|failure)
 ///   * Submission to AC and AC response: submit_requests (used to measure submission rate),
-///     submit_txns.{ac_status_code}, submit_txns.{mempool_status_code}, submit_txns.{vm_status},
-///     submit_txns.{grpc_error}, submit_read_requests.{error};
+///     submit_txns.failure.ac.{ac_status_code}, submit_txns.failure.mempool.{mempool_status_code},
+///     submit_txns.failure.vm..{vm_status}, submit_txns.{grpc_error}, submit_read_requests.{error};
 ///   * Final status within epoch: committed_txns, timedout_txns;
 /// * Gauges: request_duration_ms, running_duration_ms, request_throughput, txns_throughput.
 /// * Histograms: read_requests.response_bytes.

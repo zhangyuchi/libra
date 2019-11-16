@@ -1,30 +1,21 @@
-#![allow(clippy::unit_arg)]
+// Copyright (c) The Libra Core Contributors
+// SPDX-License-Identifier: Apache-2.0
 
-use crate::{access_path::AccessPath, account_address::AccountAddress};
-#[cfg(any(test, feature = "testing"))]
-use canonical_serialization::SimpleSerializer;
-use canonical_serialization::{
-    CanonicalDeserialize, CanonicalDeserializer, CanonicalSerialize, CanonicalSerializer,
-};
-#[cfg(any(test, feature = "testing"))]
-use crypto::HashValue;
+use crate::account_address::AccountAddress;
 use failure::prelude::*;
 use hex;
-#[cfg(any(test, feature = "testing"))]
+use libra_crypto::HashValue;
+#[cfg(feature = "fuzzing")]
 use proptest_derive::Arbitrary;
-use proto_conv::{FromProto, IntoProto};
-use serde::{Deserialize, Serialize};
+use serde::{de, ser, Deserialize, Serialize};
 use std::{convert::TryFrom, fmt};
-use tiny_keccak::sha3_256;
 
 /// Size of an event key.
 pub const EVENT_KEY_LENGTH: usize = 32;
 
 /// A struct that represents a globally unique id for an Event stream that a user can listen to.
-#[derive(
-    Ord, PartialOrd, Eq, PartialEq, Hash, Debug, Default, Clone, Serialize, Deserialize, Copy,
-)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
+#[derive(Ord, PartialOrd, Eq, PartialEq, Hash, Debug, Default, Clone, Copy)]
+#[cfg_attr(feature = "fuzzing", derive(Arbitrary))]
 pub struct EventKey([u8; EVENT_KEY_LENGTH]);
 
 impl EventKey {
@@ -43,28 +34,53 @@ impl EventKey {
         self.0.to_vec()
     }
 
-    /// Return the AccessPath to where this event is stored in EventStore.
-    /// TODO: Clean up this API by creating a new type wrapper for this new key type.
-    pub fn as_access_path(&self) -> Result<AccessPath> {
-        let key = AccountAddress::try_from(&self.0)?;
-        Ok(AccessPath::new(key, vec![]))
-    }
-
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(feature = "fuzzing")]
     /// Create a random event key for testing
     pub fn random() -> Self {
         EventKey::try_from(HashValue::random().to_vec().as_slice()).unwrap()
     }
 
-    #[cfg(any(test, feature = "testing"))]
     /// Create a unique handle by using an AccountAddress and a counter.
     pub fn new_from_address(addr: &AccountAddress, salt: u64) -> Self {
-        let mut serializer: SimpleSerializer<Vec<u8>> = SimpleSerializer::new();
-        serializer.encode_u64(salt).expect("Can't serialize salt");
-        serializer
-            .encode_struct(addr)
-            .expect("Can't serialize address");
-        EventKey(sha3_256(&serializer.get_output()))
+        let mut output_bytes = salt.to_be_bytes().to_vec();
+        output_bytes.append(&mut addr.to_vec());
+        EventKey(*HashValue::from_sha3_256(&output_bytes).as_ref())
+    }
+}
+
+// TODO(#1307)
+impl ser::Serialize for EventKey {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: ser::Serializer,
+    {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+impl<'de> de::Deserialize<'de> for EventKey {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        struct EventKeyVisitor;
+
+        impl<'de> de::Visitor<'de> for EventKeyVisitor {
+            type Value = EventKey;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("EventKey in bytes")
+            }
+
+            fn visit_bytes<E>(self, value: &[u8]) -> std::result::Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                EventKey::try_from(value).map_err(E::custom)
+            }
+        }
+
+        deserializer.deserialize_bytes(EventKeyVisitor)
     }
 }
 
@@ -85,12 +101,12 @@ impl TryFrom<&[u8]> for EventKey {
 }
 
 /// A Rust representation of an Event Handle Resource.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EventHandle {
-    /// The associated globally unique key that is used as the key to the EventStore.
-    key: EventKey,
     /// Number of events in the event stream.
     count: u64,
+    /// The associated globally unique key that is used as the key to the EventStore.
+    key: EventKey,
 }
 
 impl EventHandle {
@@ -108,7 +124,12 @@ impl EventHandle {
         self.count
     }
 
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(feature = "fuzzing")]
+    pub fn count_mut(&mut self) -> &mut u64 {
+        &mut self.count
+    }
+
+    #[cfg(feature = "fuzzing")]
     /// Create a random event handle for testing
     pub fn random_handle(count: u64) -> Self {
         Self {
@@ -117,7 +138,7 @@ impl EventHandle {
         }
     }
 
-    #[cfg(any(test, feature = "testing"))]
+    #[cfg(feature = "fuzzing")]
     /// Derive a unique handle by using an AccountAddress and a counter.
     pub fn new_from_address(addr: &AccountAddress, salt: u64) -> Self {
         Self {
@@ -137,55 +158,5 @@ impl fmt::Display for EventKey {
     fn fmt(&self, f: &mut fmt::Formatter) -> std::fmt::Result {
         // Forward to the LowerHex impl with a "0x" prepended (the # flag).
         write!(f, "{:#x}", self)
-    }
-}
-
-impl FromProto for EventKey {
-    type ProtoType = Vec<u8>;
-
-    fn from_proto(key: Self::ProtoType) -> Result<Self> {
-        EventKey::try_from(&key[..])
-    }
-}
-
-impl IntoProto for EventKey {
-    type ProtoType = Vec<u8>;
-
-    fn into_proto(self) -> Self::ProtoType {
-        self.0.to_vec()
-    }
-}
-
-impl CanonicalSerialize for EventKey {
-    fn serialize(&self, serializer: &mut impl CanonicalSerializer) -> Result<()> {
-        // We cannot use encode_raw_bytes as this structure will represent how Move Value of type
-        // EventKey is serialized into. And since Move doesn't have fix length bytearray, values
-        // can't be encoded in the fix length fasion.
-        serializer.encode_variable_length_bytes(&self.0)?;
-        Ok(())
-    }
-}
-
-impl CanonicalDeserialize for EventKey {
-    fn deserialize(deserializer: &mut impl CanonicalDeserializer) -> Result<Self> {
-        let bytes = deserializer.decode_variable_length_bytes()?;
-        Self::try_from(bytes.as_slice())
-    }
-}
-
-impl CanonicalSerialize for EventHandle {
-    fn serialize(&self, serializer: &mut impl CanonicalSerializer) -> Result<()> {
-        serializer
-            .encode_u64(self.count)?
-            .encode_struct(&self.key)?;
-        Ok(())
-    }
-}
-
-impl CanonicalDeserialize for EventHandle {
-    fn deserialize(deserializer: &mut impl CanonicalDeserializer) -> Result<Self> {
-        let count = deserializer.decode_u64()?;
-        let key = deserializer.decode_struct()?;
-        Ok(EventHandle { count, key })
     }
 }

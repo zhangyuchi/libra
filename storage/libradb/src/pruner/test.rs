@@ -3,13 +3,13 @@
 
 use super::*;
 use crate::{change_set::ChangeSet, state_store::StateStore, LibraDB};
-use crypto::HashValue;
-use std::collections::HashMap;
-use tempfile::tempdir;
-use types::{
+use libra_crypto::HashValue;
+use libra_tools::tempdir::TempPath;
+use libra_types::{
     account_address::{AccountAddress, ADDRESS_LENGTH},
     account_state_blob::AccountStateBlob,
 };
+use std::collections::HashMap;
 
 fn put_account_state_set(
     db: &DB,
@@ -49,7 +49,7 @@ fn test_pruner() {
     let value1 = AccountStateBlob::from(vec![0x02]);
     let value2 = AccountStateBlob::from(vec![0x03]);
 
-    let tmp_dir = tempdir().unwrap();
+    let tmp_dir = TempPath::new();
     let db = LibraDB::new(&tmp_dir).db;
     let state_store = &StateStore::new(Arc::clone(&db));
     let pruner = Pruner::new(
@@ -113,7 +113,7 @@ fn test_worker_quit_eagerly() {
     let value1 = AccountStateBlob::from(vec![0x02]);
     let value2 = AccountStateBlob::from(vec![0x03]);
 
-    let tmp_dir = tempdir().unwrap();
+    let tmp_dir = TempPath::new();
     let db = LibraDB::new(&tmp_dir).db;
     let state_store = &StateStore::new(Arc::clone(&db));
 

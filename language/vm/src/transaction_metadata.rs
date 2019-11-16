@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::gas_schedule::{AbstractMemorySize, GasAlgebra, GasCarrier, GasPrice, GasUnits};
-use crypto::ed25519::{compat, Ed25519PublicKey};
-use types::{account_address::AccountAddress, transaction::SignedTransaction};
+use libra_crypto::ed25519::{compat, Ed25519PublicKey};
+use libra_types::{account_address::AccountAddress, transaction::SignedTransaction};
 
 pub struct TransactionMetadata {
     pub sender: AccountAddress,
@@ -18,7 +18,7 @@ impl TransactionMetadata {
     pub fn new(txn: &SignedTransaction) -> Self {
         Self {
             sender: txn.sender(),
-            public_key: txn.public_key().into(),
+            public_key: txn.public_key(),
             sequence_number: txn.sequence_number(),
             max_gas_amount: GasUnits::new(txn.max_gas_amount()),
             gas_unit_price: GasPrice::new(txn.gas_unit_price()),

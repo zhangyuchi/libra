@@ -7,7 +7,7 @@
 //! # Examples
 //!
 //! ```
-//! use crypto::{traits::Uniform, vrf::ecvrf::*};
+//! use libra_crypto::{traits::Uniform, vrf::ecvrf::*};
 //! use rand::{rngs::StdRng, SeedableRng};
 //!
 //! let message = b"Test message";
@@ -22,7 +22,7 @@
 //! using a `VRFPublicKey`:
 //!
 //! ```
-//! # use crypto::{traits::Uniform, vrf::ecvrf::*};
+//! # use libra_crypto::{traits::Uniform, vrf::ecvrf::*};
 //! # use rand::{rngs::StdRng, SeedableRng};
 //! # let message = b"Test message";
 //! # let mut rng: StdRng = SeedableRng::from_seed([0; 32]);
@@ -35,7 +35,7 @@
 //! Produce a pseudorandom output from a `Proof`:
 //!
 //! ```
-//! # use crypto::{traits::Uniform, vrf::ecvrf::*};
+//! # use libra_crypto::{traits::Uniform, vrf::ecvrf::*};
 //! # use rand::{rngs::StdRng, SeedableRng};
 //! # let message = b"Test message";
 //! # let mut rng: StdRng = SeedableRng::from_seed([0; 32]);
@@ -56,8 +56,8 @@ use ed25519_dalek::{
     self, Digest, PublicKey as ed25519_PublicKey, SecretKey as ed25519_PrivateKey, Sha512,
 };
 use failure::prelude::*;
+use libra_crypto_derive::Deref;
 use serde::{Deserialize, Serialize};
-use std::ops::Deref;
 
 const SUITE: u8 = 0x03;
 const ONE: u8 = 0x01;
@@ -70,11 +70,11 @@ pub const OUTPUT_LENGTH: usize = 64;
 pub const PROOF_LENGTH: usize = 80;
 
 /// An ECVRF private key
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Deref, Debug)]
 pub struct VRFPrivateKey(ed25519_PrivateKey);
 
 /// An ECVRF public key
-#[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Deref, PartialEq, Eq)]
 pub struct VRFPublicKey(ed25519_PublicKey);
 
 /// A longer private key which is slightly optimized for proof generation.
@@ -131,14 +131,6 @@ impl TryFrom<&[u8]> for VRFPrivateKey {
         Ok(VRFPrivateKey(
             ed25519_PrivateKey::from_bytes(bytes).unwrap(),
         ))
-    }
-}
-
-impl Deref for VRFPrivateKey {
-    type Target = ed25519_PrivateKey;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
     }
 }
 
@@ -217,14 +209,6 @@ impl<'a> From<&'a VRFPrivateKey> for VRFPublicKey {
         let secret: &ed25519_PrivateKey = private_key;
         let public: ed25519_PublicKey = secret.into();
         VRFPublicKey(public)
-    }
-}
-
-impl Deref for VRFPublicKey {
-    type Target = ed25519_PublicKey;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
     }
 }
 

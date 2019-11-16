@@ -13,18 +13,18 @@ use crate::{
         jellyfish_merkle_node::JellyfishMerkleNodeSchema, stale_node_index::StaleNodeIndexSchema,
     },
 };
-use crypto::{hash::CryptoHash, HashValue};
 use failure::prelude::*;
 use jellyfish_merkle::{
-    node_type::{Node, NodeKey},
+    node_type::{LeafNode, Node, NodeKey},
     JellyfishMerkleTree, TreeReader,
 };
-use schemadb::DB;
-use std::{collections::HashMap, sync::Arc};
-use types::{
+use libra_crypto::{hash::CryptoHash, HashValue};
+use libra_types::{
     account_address::AccountAddress, account_state_blob::AccountStateBlob,
     proof::SparseMerkleProof, transaction::Version,
 };
+use schemadb::DB;
+use std::{collections::HashMap, sync::Arc};
 
 pub(crate) struct StateStore {
     db: Arc<DB>,
@@ -100,10 +100,11 @@ impl StateStore {
 }
 
 impl TreeReader for StateStore {
-    fn get_node(&self, node_key: &NodeKey) -> Result<Node> {
-        Ok(self
-            .db
-            .get::<JellyfishMerkleNodeSchema>(node_key)?
-            .ok_or_else(|| format_err!("Failed to find node with node_key {:?}", node_key))?)
+    fn get_node_option(&self, node_key: &NodeKey) -> Result<Option<Node>> {
+        Ok(self.db.get::<JellyfishMerkleNodeSchema>(node_key)?)
+    }
+
+    fn get_rightmost_leaf(&self) -> Result<Option<(NodeKey, LeafNode)>> {
+        unimplemented!();
     }
 }

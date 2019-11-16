@@ -7,8 +7,8 @@
 //! # Example
 //!
 //! ```
-//! use crypto::hash::{CryptoHasher, TestOnlyHasher};
-//! use crypto::{
+//! use libra_crypto::hash::{CryptoHasher, TestOnlyHasher};
+//! use libra_crypto::{
 //!     bls12381::*,
 //!     traits::{Signature, SigningKey, Uniform},
 //! };
@@ -31,17 +31,15 @@
 //! performance in consensus.
 
 use crate::{traits::*, HashValue};
-use bincode::{deserialize, serialize};
 use core::convert::TryFrom;
-use crypto_derive::{SilentDebug, SilentDisplay};
 use failure::prelude::*;
+use libra_crypto_derive::{Deref, SilentDebug, SilentDisplay};
 use pairing::{
     bls12_381::{Fr, FrRepr},
     PrimeField,
 };
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use std::ops::Deref;
 
 /// The length of the BLS12381PrivateKey.
 pub const BLS12381_PRIVATE_KEY_LENGTH: usize = 32;
@@ -55,15 +53,18 @@ type ThresholdBLSPrivateKey =
     threshold_crypto::serde_impl::SerdeSecret<threshold_crypto::SecretKey>;
 
 /// A BLS12-381 private key.
-#[derive(Serialize, Deserialize, SilentDisplay, SilentDebug)]
+#[derive(Serialize, Deserialize, Deref, SilentDisplay, SilentDebug)]
 pub struct BLS12381PrivateKey(ThresholdBLSPrivateKey);
 
+#[cfg(feature = "assert-private-keys-not-cloneable")]
+static_assertions::assert_not_impl_any!(BLS12381PrivateKey: Clone);
+
 /// A BLS12-381 public key.
-#[derive(Clone, Hash, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Clone, Hash, Serialize, Deserialize, Deref, Debug, PartialEq, Eq)]
 pub struct BLS12381PublicKey(threshold_crypto::PublicKey);
 
 /// A BLS12-381 signature.
-#[derive(Clone, Hash, Serialize, Deserialize, Debug, PartialEq, Eq)]
+#[derive(Clone, Hash, Serialize, Deserialize, Deref, Debug, PartialEq, Eq)]
 pub struct BLS12381Signature(threshold_crypto::Signature);
 
 impl BLS12381PublicKey {
@@ -137,7 +138,7 @@ impl Uniform for BLS12381PrivateKey {
 
 impl std::cmp::PartialEq<Self> for BLS12381PrivateKey {
     fn eq(&self, other: &Self) -> bool {
-        serialize(self).unwrap() == serialize(other).unwrap()
+        lcs::to_bytes(self).unwrap() == lcs::to_bytes(other).unwrap()
     }
 }
 
@@ -151,7 +152,7 @@ impl TryFrom<&[u8]> for BLS12381PrivateKey {
             return Err(CryptoMaterialError::WrongLengthError);
         }
         // First we deserialize raw bytes, which may or may not work.
-        let key_res = deserialize::<BLS12381PrivateKey>(bytes);
+        let key_res = lcs::from_bytes(bytes);
         // Note that the underlying implementation of SerdeSecret checks for validation during
         // deserialization. Also, we don't need to check for validity of the derived PublicKey, as a
         // correct SerdeSecret (checked during deserialization that is in field) will always produce
@@ -162,7 +163,7 @@ impl TryFrom<&[u8]> for BLS12381PrivateKey {
 impl ValidKey for BLS12381PrivateKey {
     fn to_bytes(&self) -> Vec<u8> {
         // This is expected to succeed as we just return the bytes of an existing key.
-        bincode::serialize(&self.0).unwrap()
+        lcs::to_bytes(&self.0).unwrap()
     }
 }
 
@@ -171,14 +172,6 @@ impl Genesis for BLS12381PrivateKey {
         let mut buf = [0u8; BLS12381_PRIVATE_KEY_LENGTH];
         buf[BLS12381_PRIVATE_KEY_LENGTH - 1] = 1;
         Self::try_from(buf.as_ref()).unwrap()
-    }
-}
-
-impl Deref for BLS12381PublicKey {
-    type Target = threshold_crypto::PublicKey;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
     }
 }
 
@@ -234,14 +227,6 @@ impl ValidKey for BLS12381PublicKey {
     }
 }
 
-impl Deref for BLS12381PrivateKey {
-    type Target = ThresholdBLSPrivateKey;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
 //////////////////////
 // Signature Traits //
 //////////////////////
@@ -282,13 +267,5 @@ impl TryFrom<&[u8]> for BLS12381Signature {
         let sig = threshold_crypto::Signature::from_bytes(&tmp)
             .map_err(|_err| CryptoMaterialError::ValidationError)?;
         Ok(BLS12381Signature(sig))
-    }
-}
-
-impl Deref for BLS12381Signature {
-    type Target = threshold_crypto::Signature;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
     }
 }

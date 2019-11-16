@@ -1,20 +1,22 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::chained_bft::{
+use crate::chained_bft::liveness::proposer_election::ProposerElection;
+use consensus_types::{
+    block::Block,
     common::{Author, Payload, Round},
-    consensus_types::block::Block,
-    liveness::proposer_election::ProposerElection,
 };
-use logger::prelude::*;
-use siphasher::sip::SipHasher24;
-use std::hash::{Hash, Hasher};
+use libra_logger::prelude::*;
 
-// A deterministic hashing function based on SipHash 2-4 hasher
-pub fn hash(val: u64) -> u64 {
-    let mut hasher = SipHasher24::new();
-    val.hash(&mut hasher);
-    hasher.finish()
+// next continuously mutates a state and returns a u64-index
+pub fn next(state: &mut Vec<u8>) -> u64 {
+    std::mem::replace(
+        state,
+        libra_crypto::HashValue::from_sha3_256(state).to_vec(),
+    );
+    let mut temp = [0u8; 8];
+    temp.copy_from_slice(&state[..8]);
+    u64::from_le_bytes(temp)
 }
 
 /// The MultiProposer maps a round to an ordered list of authors.
@@ -44,8 +46,18 @@ pub struct MultiProposer<T> {
 }
 
 impl<T> MultiProposer<T> {
-    pub fn new(proposers: Vec<Author>, num_proposers_per_round: usize) -> Self {
+    pub fn new(proposers: Vec<Author>, mut num_proposers_per_round: usize) -> Self {
         assert!(num_proposers_per_round > 0);
+        if num_proposers_per_round > proposers.len() {
+            error!(
+                "num_proposers_per_round = {}, while there are just {} proposers, adjusting to {}",
+                num_proposers_per_round,
+                proposers.len(),
+                proposers.len()
+            );
+            num_proposers_per_round = proposers.len();
+        }
+
         assert!(num_proposers_per_round <= proposers.len());
         Self {
             proposers,
@@ -58,11 +70,14 @@ impl<T> MultiProposer<T> {
     fn get_candidates(&self, round: Round) -> Vec<Author> {
         let mut res = vec![];
         let mut candidates = self.proposers.clone();
-        let mut cur_val = round;
+        let mut state = round.to_le_bytes().to_vec();
         for _ in 0..self.num_proposers_per_round {
-            cur_val = hash(cur_val);
-            let idx = (cur_val % candidates.len() as u64) as usize;
-            res.push(candidates.swap_remove(idx));
+            let idx = next(&mut state);
+            // note: this modular reduction has a slight bias.
+            // Yet, the bias is so small in practice that it is not worth
+            // addressing this edge case.
+            let idx = idx % (candidates.len() as u64);
+            res.push(candidates.swap_remove(idx as usize));
         }
         res
     }
@@ -82,12 +97,7 @@ impl<T: Payload> ProposerElection<T> for MultiProposer<T> {
     }
 
     fn process_proposal(&mut self, proposal: Block<T>) -> Option<Block<T>> {
-        let author = match proposal.author() {
-            Some(author) => author,
-            None => {
-                return None;
-            }
-        };
+        let author = proposal.author()?;
         let round = proposal.round();
         let candidates = self.get_candidates(round);
         for (rank, candidate) in candidates.iter().enumerate() {

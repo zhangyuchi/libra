@@ -1,4 +1,7 @@
-use logger::prelude::*;
+// Copyright (c) The Libra Core Contributors
+// SPDX-License-Identifier: Apache-2.0
+
+use libra_logger::prelude::*;
 use std::{thread, time, vec::IntoIter};
 
 /// Items are returned in the world of microseconds.
@@ -69,12 +72,10 @@ mod tests {
         let flood = ConstantRate::new(std::u64::MAX, vec.into_iter());
 
         let now = time::Instant::now();
-        for item in flood {
-            let elapsed = now.elapsed().as_micros();
-            println!("Ret {:?} after {:?} us", item, elapsed);
-        }
+        // consume all elements
+        flood.for_each(drop);
         let elapsed = now.elapsed().as_micros();
-        // Loop should finish at an glimpse.
+        // Loop should finish instantly
         assert!(elapsed < 1000);
     }
 
@@ -84,10 +85,9 @@ mod tests {
         let const_rate = ConstantRate::new(2, vec.into_iter());
 
         let mut now = time::Instant::now();
-        for item in const_rate {
+        for _item in const_rate {
             let new_now = time::Instant::now();
             let delta = new_now.duration_since(now).as_micros();
-            println!("Ret {:?} after {:?} us", item, delta);
             // Interval between each call to next() should be roughly 0.5 second.
             assert!(delta < 510_000);
             assert!(delta > 490_000);
@@ -101,10 +101,9 @@ mod tests {
         let const_rate = ConstantRate::new(2, vec.into_iter());
 
         let mut now = time::Instant::now();
-        for item in const_rate {
+        for _item in const_rate {
             let new_now = time::Instant::now();
             let delta = new_now.duration_since(now).as_micros();
-            println!("Ret {:?} after {:?} us", item, delta);
             // Interval between each call to next() should be roughly 0.5 second.
             assert!(delta < 510_000);
             assert!(delta > 490_000);

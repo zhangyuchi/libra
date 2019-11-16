@@ -1,26 +1,20 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-#![allow(clippy::unit_arg)]
-
 use bech32::{Bech32, FromBase32, ToBase32};
 use bytes::Bytes;
-use canonical_serialization::{
-    CanonicalDeserialize, CanonicalDeserializer, CanonicalSerialize, CanonicalSerializer,
-};
-use crypto::{
-    hash::{AccountAddressHasher, CryptoHash, CryptoHasher},
-    HashValue, VerifyingKey,
-};
 use failure::prelude::*;
 use hex;
-#[cfg(any(test, feature = "testing"))]
+use libra_crypto::{
+    hash::{CryptoHash, CryptoHasher},
+    HashValue, VerifyingKey,
+};
+use libra_crypto_derive::CryptoHasher;
+#[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
-use proto_conv::{FromProto, IntoProto};
 use rand::{rngs::OsRng, Rng};
 use serde::{Deserialize, Serialize};
 use std::{convert::TryFrom, fmt, str::FromStr};
-use tiny_keccak::Keccak;
 
 pub const ADDRESS_LENGTH: usize = 32;
 
@@ -30,12 +24,14 @@ const LIBRA_NETWORK_ID_SHORT: &str = "lb";
 
 /// A struct that represents an account address.
 /// Currently Public Key is used.
-#[derive(Ord, PartialOrd, Eq, PartialEq, Hash, Default, Clone, Serialize, Deserialize, Copy)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
+#[derive(
+    Ord, PartialOrd, Eq, PartialEq, Hash, Default, Clone, Copy, Deserialize, Serialize, CryptoHasher,
+)]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub struct AccountAddress([u8; ADDRESS_LENGTH]);
 
 impl AccountAddress {
-    pub fn new(address: [u8; ADDRESS_LENGTH]) -> Self {
+    pub const fn new(address: [u8; ADDRESS_LENGTH]) -> Self {
         AccountAddress(address)
     }
 
@@ -55,13 +51,7 @@ impl AccountAddress {
     }
 
     pub fn from_public_key<PublicKey: VerifyingKey>(public_key: &PublicKey) -> Self {
-        // TODO: using keccak directly instead of crypto::hash because we have to make sure we use
-        // the same hash function that the Move transaction prologue is using.
-        // TODO: keccak is just a placeholder, make a principled choice for the hash function
-        let mut keccak = Keccak::new_sha3_256();
-        let mut hash = [0u8; ADDRESS_LENGTH];
-        keccak.update(&public_key.to_bytes());
-        keccak.finalize(&mut hash);
+        let hash = *HashValue::from_sha3_256(&public_key.to_bytes()).as_ref();
         AccountAddress::new(hash)
     }
 
@@ -182,22 +172,6 @@ impl From<AccountAddress> for Bytes {
     }
 }
 
-impl FromProto for AccountAddress {
-    type ProtoType = Vec<u8>;
-
-    fn from_proto(addr: Self::ProtoType) -> Result<Self> {
-        AccountAddress::try_from(&addr[..])
-    }
-}
-
-impl IntoProto for AccountAddress {
-    type ProtoType = Vec<u8>;
-
-    fn into_proto(self) -> Self::ProtoType {
-        self.0.to_vec()
-    }
-}
-
 impl From<&AccountAddress> for String {
     fn from(addr: &AccountAddress) -> String {
         ::hex::encode(addr.as_ref())
@@ -240,19 +214,5 @@ impl TryFrom<AccountAddress> for Bech32 {
     fn try_from(addr: AccountAddress) -> Result<Bech32> {
         let base32_hash = addr.0.to_base32();
         bech32::Bech32::new(LIBRA_NETWORK_ID_SHORT.into(), base32_hash).map_err(Into::into)
-    }
-}
-
-impl CanonicalSerialize for AccountAddress {
-    fn serialize(&self, serializer: &mut impl CanonicalSerializer) -> Result<()> {
-        serializer.encode_variable_length_bytes(&self.0)?;
-        Ok(())
-    }
-}
-
-impl CanonicalDeserialize for AccountAddress {
-    fn deserialize(deserializer: &mut impl CanonicalDeserializer) -> Result<Self> {
-        let bytes = deserializer.decode_variable_length_bytes()?;
-        Self::try_from(bytes)
     }
 }

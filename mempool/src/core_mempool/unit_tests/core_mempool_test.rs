@@ -1,19 +1,17 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    core_mempool::{
-        unit_tests::common::{
-            add_signed_txn, add_txn, add_txns_to_mempool, exist_in_metrics_cache, setup_mempool,
-            TestTransaction,
-        },
-        CoreMempool, TimelineState,
+use crate::core_mempool::{
+    unit_tests::common::{
+        add_signed_txn, add_txn, add_txns_to_mempool, exist_in_metrics_cache, setup_mempool,
+        TestTransaction,
     },
-    proto::shared::mempool_status::MempoolAddTransactionStatusCode,
+    CoreMempool, TimelineState,
 };
-use config::config::NodeConfigHelpers;
+use libra_config::config::NodeConfigHelpers;
+use libra_mempool_shared_proto::proto::mempool_status::MempoolAddTransactionStatusCode;
+use libra_types::transaction::SignedTransaction;
 use std::{collections::HashSet, time::Duration};
-use types::transaction::SignedTransaction;
 
 #[test]
 fn test_transaction_ordering() {
@@ -360,4 +358,18 @@ fn test_gc_ready_transaction() {
     let (timeline, _) = pool.read_timeline(0, 10);
     assert_eq!(timeline.len(), 1);
     assert_eq!(timeline[0].sequence_number(), 0);
+}
+
+#[test]
+fn test_clean_stuck_transactions() {
+    let mut pool = setup_mempool().0;
+    for seq in 0..5 {
+        add_txn(&mut pool, TestTransaction::new(0, seq, 1)).unwrap();
+    }
+    let db_sequence_number = 10;
+    let txn = TestTransaction::new(0, db_sequence_number, 1).make_signed_transaction();
+    pool.add_txn(txn, 0, db_sequence_number, 100, TimelineState::NotReady);
+    let block = pool.get_block(10, HashSet::new());
+    assert_eq!(block.len(), 1);
+    assert_eq!(block[0].sequence_number(), 10);
 }

@@ -51,9 +51,6 @@
 //! 6. Sends the serialized response message to the dialer.
 //! 7. Half-closes their output side to complete the substream close.
 //!
-//! Note: negotiated substreams are currently framed with the
-//! [muiltiformats unsigned varint length-prefix](https://github.com/multiformats/unsigned-varint)
-//!
 //! [muxers]: ../../../netcore/multiplexing/index.html
 //! [substream negotiation]: ../../../netcore/negotiate/index.html
 //! [`protocol-select`]: ../../../netcore/negotiate/index.html
@@ -70,24 +67,32 @@ use channel;
 use error::RpcError;
 use futures::{
     channel::oneshot,
-    compat::{Future01CompatExt, Sink01CompatExt},
     future::{self, FutureExt, TryFutureExt},
-    io::{AsyncRead, AsyncReadExt, AsyncWrite},
+    io::{AsyncRead, AsyncWrite},
     sink::SinkExt,
     stream::StreamExt,
     task::Context,
 };
-use logger::prelude::*;
+use libra_logger::prelude::*;
+use libra_types::PeerId;
+use netcore::compat::IoCompat;
 use std::{fmt::Debug, io, time::Duration};
-use tokio::{codec::Framed, prelude::FutureExt as Future01Ext, runtime::TaskExecutor};
-use types::PeerId;
-use unsigned_varint::codec::UviBytes;
+use tokio::{
+    codec::{Framed, LengthDelimitedCodec},
+    future::FutureExt as _,
+    runtime::TaskExecutor,
+};
 
 pub mod error;
 pub mod utils;
 
 #[cfg(test)]
 mod test;
+
+#[cfg(any(feature = "fuzzing", test))]
+#[path = "fuzzing.rs"]
+/// fuzzing module for the rpc protocol
+pub mod fuzzing;
 
 /// A wrapper struct for an inbound rpc request and its associated context.
 #[derive(Debug)]
@@ -297,12 +302,11 @@ async fn handle_outbound_rpc<TSubstream>(
 
             // Future to run the actual outbound rpc protocol and get the results.
             let mut f_rpc_res = handle_outbound_rpc_inner(peer_mgr_tx, peer_id, protocol, req_data)
-                .boxed()
-                .compat()
                 .timeout(timeout)
-                .compat()
-                // Convert tokio timeout::Error to RpcError
-                .map_err(Into::<RpcError>::into);
+                .map_err(Into::<RpcError>::into)
+                .map(|r| r.and_then(|x| x))
+                .boxed()
+                .fuse();
 
             // If the rpc client drops their oneshot receiver, this future should
             // cancel the request.
@@ -313,7 +317,9 @@ async fn handle_outbound_rpc<TSubstream>(
                 res = f_rpc_res => {
                     // Log any errors.
                     if let Err(err) = &res {
-                        counters::RPC_REQUESTS_FAILED.inc();
+                        counters::LIBRA_NETWORK_RPC_MESSAGES
+                            .with_label_values(&["request", "failed"])
+                            .inc();
                         warn!(
                             "Error making outbound rpc request to {}: {:?}",
                             peer_id.short_str(), err
@@ -322,13 +328,17 @@ async fn handle_outbound_rpc<TSubstream>(
 
                     // Propagate the results to the rpc client layer.
                     if res_tx.send(res).is_err() {
-                        counters::RPC_REQUESTS_CANCELLED.inc();
+                        counters::LIBRA_NETWORK_RPC_MESSAGES
+                            .with_label_values(&["request", "cancelled"])
+                            .inc();
                         debug!("Rpc client canceled outbound rpc call to {}", peer_id.short_str());
                     }
                 },
                 // The rpc client canceled the request
                 cancel = f_rpc_cancel => {
-                    counters::RPC_REQUESTS_CANCELLED.inc();
+                    counters::LIBRA_NETWORK_RPC_MESSAGES
+                        .with_label_values(&["request", "cancelled"])
+                        .inc();
                     debug!("Rpc client canceled outbound rpc call to {}", peer_id.short_str());
                 },
             }
@@ -345,19 +355,23 @@ async fn handle_outbound_rpc_inner<TSubstream>(
 where
     TSubstream: AsyncRead + AsyncWrite + Send + Unpin,
 {
-    let _timer = counters::RPC_LATENCY.start_timer();
+    let _timer = counters::LIBRA_NETWORK_RPC_LATENCY.start_timer();
     // Request a new substream with the peer.
     let substream = peer_mgr_tx.open_substream(peer_id, protocol).await?;
     // Rpc messages are length-prefixed.
-    let mut substream = Framed::new(substream.compat(), UviBytes::default()).sink_compat();
+    let mut substream = Framed::new(IoCompat::new(substream), LengthDelimitedCodec::new());
     // Send the rpc request data.
     let req_len = req_data.len();
     substream.buffered_send(req_data).await?;
     // We won't send anything else on this substream, so we can half-close our
     // output side.
     substream.close().await?;
-    counters::RPC_REQUESTS_SENT.inc();
-    counters::RPC_REQUEST_BYTES_SENT.inc_by(req_len as i64);
+    counters::LIBRA_NETWORK_RPC_MESSAGES
+        .with_label_values(&["request", "sent"])
+        .inc();
+    counters::LIBRA_NETWORK_RPC_BYTES
+        .with_label_values(&["request", "sent"])
+        .observe(req_len as f64);
 
     // Wait for listener's response.
     let res_data = match substream.next().await {
@@ -392,18 +406,16 @@ async fn handle_inbound_substream<TSubstream>(
                 substream.protocol,
                 substream.substream,
             )
-            .boxed()
-            .compat()
             .timeout(timeout)
-            .compat()
+            .map_err(Into::<RpcError>::into)
+            .map(|r| r.and_then(|x| x))
             .await;
-
-            // Convert tokio timeout::Error to RpcError
-            let res = res.map_err(Into::<RpcError>::into);
 
             // Log any errors.
             if let Err(err) = res {
-                counters::RPC_RESPONSES_FAILED.inc();
+                counters::LIBRA_NETWORK_RPC_MESSAGES
+                    .with_label_values(&["response", "failed"])
+                    .inc();
                 warn!(
                     "Error handling inbound rpc request from {}: {:?}",
                     peer_id.short_str(),
@@ -411,7 +423,8 @@ async fn handle_inbound_substream<TSubstream>(
                 );
             }
         }
-        notif => unreachable!(
+        notif => debug_assert!(
+            false,
             "Received unexpected event from PeerManager: {:?}, expected NewInboundSubstream",
             notif
         ),
@@ -428,13 +441,15 @@ where
     TSubstream: AsyncRead + AsyncWrite + Send + Unpin,
 {
     // Rpc messages are length-prefixed.
-    let mut substream = Framed::new(substream.compat(), UviBytes::default()).sink_compat();
+    let mut substream = Framed::new(IoCompat::new(substream), LengthDelimitedCodec::new());
     // Read the rpc request data.
     let req_data = match substream.next().await {
         Some(req_data) => req_data?.freeze(),
         None => return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into()),
     };
-    counters::RPC_REQUESTS_RECEIVED.inc();
+    counters::LIBRA_NETWORK_RPC_MESSAGES
+        .with_label_values(&["request", "received"])
+        .inc();
 
     // Wait for dialer to half-close their side.
     if substream.next().await.is_some() {
@@ -468,8 +483,12 @@ where
     // our output. The initiator will have also half-closed their side before
     // this, so this should gracefully shutdown the socket.
     substream.close().await?;
-    counters::RPC_RESPONSES_SENT.inc();
-    counters::RPC_RESPONSE_BYTES_SENT.inc_by(res_len as i64);
+    counters::LIBRA_NETWORK_RPC_MESSAGES
+        .with_label_values(&["response", "sent"])
+        .inc();
+    counters::LIBRA_NETWORK_RPC_BYTES
+        .with_label_values(&["response", "sent"])
+        .observe(res_len as f64);
 
     Ok(())
 }

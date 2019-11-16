@@ -3,8 +3,16 @@
 
 use super::*;
 use crate::LibraDB;
-use crypto::hash::ACCUMULATOR_PLACEHOLDER_HASH;
 use itertools::Itertools;
+use libra_crypto::hash::ACCUMULATOR_PLACEHOLDER_HASH;
+use libra_proptest_helpers::Index;
+use libra_tools::tempdir::TempPath;
+use libra_types::{
+    account_address::AccountAddress,
+    contract_event::ContractEvent,
+    event::EventKey,
+    proptest_types::{AccountInfoUniverse, ContractEventGen},
+};
 use proptest::{
     collection::{hash_set, vec},
     prelude::*,
@@ -12,11 +20,6 @@ use proptest::{
 };
 use rand::Rng;
 use std::collections::HashMap;
-use tempfile::tempdir;
-use types::{
-    account_address::AccountAddress, contract_event::ContractEvent, event::EventKey,
-    proof::verify_event_accumulator_element, proptest_types::renumber_events,
-};
 
 fn save(store: &EventStore, version: Version, events: &[ContractEvent]) -> HashValue {
     let mut cs = ChangeSet::new();
@@ -32,7 +35,7 @@ fn save(store: &EventStore, version: Version, events: &[ContractEvent]) -> HashV
 
 #[test]
 fn test_put_empty() {
-    let tmp_dir = tempdir().unwrap();
+    let tmp_dir = TempPath::new();
     let db = LibraDB::new(&tmp_dir);
     let store = &db.event_store;
     let mut cs = ChangeSet::new();
@@ -44,7 +47,7 @@ fn test_put_empty() {
 
 #[test]
 fn test_error_on_get_from_empty() {
-    let tmp_dir = tempdir().unwrap();
+    let tmp_dir = TempPath::new();
     let db = LibraDB::new(&tmp_dir);
     let store = &db.event_store;
 
@@ -58,7 +61,7 @@ proptest! {
 
     #[test]
     fn test_put_get_verify(events in vec(any::<ContractEvent>().no_shrink(), 1..100)) {
-        let tmp_dir = tempdir().unwrap();
+        let tmp_dir = TempPath::new();
         let db = LibraDB::new(&tmp_dir);
         let store = &db.event_store;
 
@@ -70,7 +73,7 @@ proptest! {
                 .get_event_with_proof_by_version_and_index(100, idx as u64)
                 .unwrap();
             prop_assert_eq!(&event, expected_event);
-            verify_event_accumulator_element(root_hash, event.hash(),  idx as u64, &proof).unwrap();
+            proof.verify(root_hash, event.hash(), idx as u64).unwrap();
         }
         // error on index >= num_events
         prop_assert!(store
@@ -90,7 +93,7 @@ proptest! {
         events3 in vec(any::<ContractEvent>().no_shrink(), 1..100),
     ) {
 
-        let tmp_dir = tempdir().unwrap();
+        let tmp_dir = TempPath::new();
         let db = LibraDB::new(&tmp_dir);
         let store = &db.event_store;
         // Save 3 chunks at different versions
@@ -114,7 +117,7 @@ proptest! {
     }
 }
 
-fn traverse_events_by_event_key(
+fn traverse_events_by_key(
     store: &EventStore,
     event_key: &EventKey,
     ledger_version: Version,
@@ -127,12 +130,7 @@ fn traverse_events_by_event_key(
     let mut last_batch_len = LIMIT;
     loop {
         let mut batch = store
-            .lookup_events_by_access_path(
-                &event_key.as_access_path().unwrap(),
-                seq_num,
-                LIMIT,
-                ledger_version,
-            )
+            .lookup_events_by_key(&event_key, seq_num, LIMIT, ledger_version)
             .unwrap();
         if last_batch_len < LIMIT {
             assert!(batch.is_empty());
@@ -164,37 +162,30 @@ fn traverse_events_by_event_key(
         .collect()
 }
 
-fn arb_event_batches() -> impl Strategy<Value = Vec<Vec<ContractEvent>>> {
-    // TODO: Get rid of the unnecessary prop_flat_map here.
-    (vec(any::<EventKey>(), 3), (0..100usize))
-        .prop_flat_map(|(raw_event_keys, num_batches)| {
-            let event_key_strategy = Union::new(raw_event_keys.clone().into_iter().map(Just));
-            vec(
-                vec(ContractEvent::strategy_impl(event_key_strategy), 0..10),
-                num_batches,
-            )
-        })
-        .prop_map(|event_batches| {
-            let mut seq_num_by_event_key = HashMap::new();
-            event_batches
-                .into_iter()
-                .map(|events| renumber_events(&events, &mut seq_num_by_event_key))
-                .collect::<Vec<_>>()
-        })
-}
-
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(10))]
 
     #[test]
-    fn test_get_events_by_access_path(event_batches in arb_event_batches().no_shrink()) {
+    fn test_get_events_by_access_path(
+        mut universe in any_with::<AccountInfoUniverse>(3),
+        gen_batches in vec(vec((any::<Index>(), any::<ContractEventGen>()), 0..=2), 0..100),
+    ) {
+        let event_batches = gen_batches
+            .into_iter()
+            .map(|gens| {
+                gens.into_iter()
+                    .map(|(index, gen)| gen.materialize(index, &mut universe))
+                    .collect()
+            })
+            .collect();
+
         test_get_events_by_access_path_impl(event_batches);
     }
 }
 
 fn test_get_events_by_access_path_impl(event_batches: Vec<Vec<ContractEvent>>) {
     // Put into db.
-    let tmp_dir = tempdir().unwrap();
+    let tmp_dir = TempPath::new();
     let db = LibraDB::new(&tmp_dir);
     let store = &db.event_store;
 
@@ -219,7 +210,7 @@ fn test_get_events_by_access_path_impl(event_batches: Vec<Vec<ContractEvent>>) {
 
     // Fetch and check.
     events_by_event_key.into_iter().for_each(|(path, events)| {
-        let traversed = traverse_events_by_event_key(&store, &path, ledger_version_plus_one);
+        let traversed = traverse_events_by_key(&store, &path, ledger_version_plus_one);
         assert_eq!(events, traversed);
     });
 }

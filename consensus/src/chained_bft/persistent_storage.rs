@@ -2,33 +2,25 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    chained_bft::{
-        common::Payload,
-        consensus_types::{block::Block, quorum_cert::QuorumCert},
-        consensusdb::ConsensusDB,
-        liveness::pacemaker_timeout_manager::HighestTimeoutCertificates,
-        safety::safety_rules::ConsensusState,
-    },
-    consensus_provider::create_storage_read_client,
+    chained_bft::consensusdb::ConsensusDB, consensus_provider::create_storage_read_client,
 };
-use config::config::NodeConfig;
-use crypto::HashValue;
-use failure::Result;
-use logger::prelude::*;
+use consensus_types::{
+    block::Block, common::Payload, quorum_cert::QuorumCert,
+    timeout_certificate::TimeoutCertificate, vote::Vote,
+};
+use failure::{Result, ResultExt};
+use libra_config::config::NodeConfig;
+use libra_crypto::HashValue;
+use libra_logger::prelude::*;
+use libra_types::ledger_info::LedgerInfo;
 use rmp_serde::{from_slice, to_vec_named};
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashSet, sync::Arc};
 
 /// Persistent storage for liveness data
 pub trait PersistentLivenessStorage: Send + Sync {
     /// Persist the highest timeout certificate for improved liveness - proof for other replicas
     /// to jump to this round
-    fn save_highest_timeout_cert(
-        &self,
-        highest_timeout_certs: HighestTimeoutCertificates,
-    ) -> Result<()>;
+    fn save_highest_timeout_cert(&self, highest_timeout_cert: TimeoutCertificate) -> Result<()>;
 }
 
 /// Persistent storage is essential for maintaining safety when a node crashes.  Specifically,
@@ -48,8 +40,8 @@ pub trait PersistentStorage<T>: PersistentLivenessStorage + Send + Sync {
     /// Delete the corresponding blocks and quorum certs atomically.
     fn prune_tree(&self, block_ids: Vec<HashValue>) -> Result<()>;
 
-    /// Persist the consensus state.
-    fn save_consensus_state(&self, state: ConsensusState) -> Result<()>;
+    /// Persist consensus' state
+    fn save_state(&self, vote: &Vote) -> Result<()>;
 
     /// When the node restart, construct the instance and returned the data read from db.
     /// This could guarantee we only read once during start, and we would panic if the
@@ -64,8 +56,9 @@ pub trait PersistentStorage<T>: PersistentLivenessStorage + Send + Sync {
 /// blocks that need cleanup or return error if the input data is inconsistent.
 #[derive(Debug)]
 pub struct RecoveryData<T> {
-    // Safety data
-    state: ConsensusState,
+    epoch: u64,
+    // The last vote message sent by this validator.
+    last_vote: Option<Vote>,
     root: (Block<T>, QuorumCert, QuorumCert),
     // 1. the blocks guarantee the topological ordering - parent <- child.
     // 2. all blocks are children of the root.
@@ -74,25 +67,23 @@ pub struct RecoveryData<T> {
     blocks_to_prune: Option<Vec<HashValue>>,
 
     // Liveness data
-    highest_timeout_certificates: HighestTimeoutCertificates,
-
-    // whether root is consistent with StateComputer, if not we need to do the state sync before
-    // starting
-    need_sync: bool,
+    highest_timeout_certificate: Option<TimeoutCertificate>,
 }
 
 impl<T: Payload> RecoveryData<T> {
     pub fn new(
-        state: ConsensusState,
+        last_vote: Option<Vote>,
         mut blocks: Vec<Block<T>>,
         mut quorum_certs: Vec<QuorumCert>,
-        root_from_storage: HashValue,
-        highest_timeout_certificates: HighestTimeoutCertificates,
+        storage_ledger: &LedgerInfo,
+        highest_timeout_certificate: Option<TimeoutCertificate>,
     ) -> Result<Self> {
         let root =
-            Self::find_root(&mut blocks, &mut quorum_certs, root_from_storage).map_err(|e| {
-                format_err!(
-                    "Blocks in db: {}\nQuorum Certs in db: {}, error: {}",
+            Self::find_root(&mut blocks, &mut quorum_certs, storage_ledger).with_context(|e| {
+                // for better readability
+                quorum_certs.sort_by_key(|qc| qc.certified_block().round());
+                format!(
+                    "Blocks in db: {}\nQuorum Certs in db: {}\nerror: {}",
                     blocks
                         .iter()
                         .map(|b| format!("\n\t{}", b))
@@ -106,26 +97,33 @@ impl<T: Payload> RecoveryData<T> {
                     e,
                 )
             })?;
+
         let blocks_to_prune = Some(Self::find_blocks_to_prune(
             root.0.id(),
             &mut blocks,
             &mut quorum_certs,
         ));
-        // if the root is different than the LI(S).block, we need to sync before start
-        let need_sync = root_from_storage != root.0.id();
         Ok(RecoveryData {
-            state,
+            epoch: root.0.epoch(),
+            last_vote,
             root,
             blocks,
             quorum_certs,
             blocks_to_prune,
-            highest_timeout_certificates,
-            need_sync,
+            highest_timeout_certificate,
         })
     }
 
-    pub fn state(&self) -> ConsensusState {
-        self.state.clone()
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    pub fn root_block(&self) -> &Block<T> {
+        &self.root.0
+    }
+
+    pub fn last_vote(&self) -> Option<Vote> {
+        self.last_vote.clone()
     }
 
     pub fn take(
@@ -144,82 +142,42 @@ impl<T: Payload> RecoveryData<T> {
             .expect("blocks_to_prune already taken")
     }
 
-    pub fn highest_timeout_certificates(&self) -> &HighestTimeoutCertificates {
-        &self.highest_timeout_certificates
-    }
-
-    pub fn root_ledger_info(&self) -> QuorumCert {
-        self.root.2.clone()
-    }
-
-    pub fn need_sync(&self) -> bool {
-        self.need_sync
+    pub fn highest_timeout_certificate(&self) -> Option<TimeoutCertificate> {
+        self.highest_timeout_certificate.clone()
     }
 
     /// Finds the root (last committed block) and returns the root block, the QC to the root block
     /// and the ledger info for the root block, return an error if it can not be found.
     ///
-    /// LI(S) is the highest known ledger info determined by storage.
-    /// LI(C) is determined by ConsensusDB: it's the highest block id that is certified as committed
-    /// by one of the QC's ledger infos.
-    ///
-    /// We guarantee a few invariants:
-    /// 1. LI(C) must exist in blocks
-    /// 2. LI(S).block.round <= LI(C).block.round
-    ///
-    /// We use the following condition to decide the root:
-    /// 1. LI(S) exist && LI(S) is ancestor of LI(C) according to blocks, root = LI(S)
-    /// 2. else root = LI(C)
-    ///
-    /// In a typical case, the QC certifying a commit of a block is persisted to ConsensusDB before
-    /// this block is committed to the storage. Hence, ConsensusDB contains the
-    /// block corresponding to LI(S) id, which is going to become the root.
-    /// An additional complication is added in this code in order to tolerate a potential failure
-    /// during state synchronization. In this case LI(S) might not be found in the blocks of
-    /// ConsensusDB: we're going to start with LI(C) and invoke state synchronizer in order to
-    /// resume the synchronization.
+    /// We guarantee that the block corresponding to the storage's latest ledger info always exists.
+    /// In the case of an epoch boundary ledger info(i.e. it has validator set), we generate the virtual genesis block.
     fn find_root(
         blocks: &mut Vec<Block<T>>,
         quorum_certs: &mut Vec<QuorumCert>,
-        root_from_storage: HashValue,
+        storage_ledger: &LedgerInfo,
     ) -> Result<(Block<T>, QuorumCert, QuorumCert)> {
-        // sort by round to guarantee the topological order of parent <- child
-        blocks.sort_by_key(Block::round);
-        let root_from_consensus = {
-            let id_to_round: HashMap<_, _> = blocks
-                .iter()
-                .map(|block| (block.id(), block.round()))
-                .collect();
-            let mut round_and_id = None;
-            for qc in quorum_certs.iter() {
-                if let Some(committed_block_id) = qc.committed_block_id() {
-                    if let Some(round) = id_to_round.get(&committed_block_id) {
-                        match round_and_id {
-                            Some((r, _)) if r > round => (),
-                            _ => round_and_id = Some((round, committed_block_id)),
-                        }
-                    }
-                }
-            }
-            match round_and_id {
-                Some((_, id)) => id,
-                None => return Err(format_err!("No LI found in quorum certs.")),
-            }
+        let root_from_storage = storage_ledger.consensus_block_id();
+        info!(
+            "The last committed block id as recorded in storage: {}",
+            root_from_storage
+        );
+
+        // We start from the block that storage's latest ledger info, if storage has end-epoch
+        // LedgerInfo, we generate the virtual genesis block
+        let root_id = if storage_ledger.next_validator_set().is_some() {
+            let genesis = Block::make_genesis_block_from_ledger_info(storage_ledger);
+            let genesis_qc =
+                QuorumCert::certificate_for_genesis_from_ledger_info(storage_ledger, genesis.id());
+            let genesis_id = genesis.id();
+            blocks.push(genesis);
+            quorum_certs.push(genesis_qc);
+            genesis_id
+        } else {
+            storage_ledger.consensus_block_id()
         };
-        let root_id = {
-            let mut tree = HashSet::new();
-            tree.insert(root_from_storage);
-            blocks.iter().for_each(|block| {
-                if tree.contains(&block.parent_id()) {
-                    tree.insert(block.id());
-                }
-            });
-            if !tree.contains(&root_from_consensus) {
-                root_from_consensus
-            } else {
-                root_from_storage
-            }
-        };
+
+        // sort by (epoch, round) to guarantee the topological order of parent <- child
+        blocks.sort_by_key(|b| (b.epoch(), b.round()));
 
         let root_idx = blocks
             .iter()
@@ -228,14 +186,17 @@ impl<T: Payload> RecoveryData<T> {
         let root_block = blocks.remove(root_idx);
         let root_quorum_cert = quorum_certs
             .iter()
-            .find(|qc| qc.certified_block_id() == root_block.id())
+            .find(|qc| qc.certified_block().id() == root_block.id())
             .ok_or_else(|| format_err!("No QC found for root: {}", root_id))?
             .clone();
         let root_ledger_info = quorum_certs
             .iter()
-            .find(|qc| qc.committed_block_id() == Some(root_block.id()))
+            .find(|qc| qc.commit_info().id() == root_block.id())
             .ok_or_else(|| format_err!("No LI found for root: {}", root_id))?
             .clone();
+
+        info!("Consensus root block is {}", root_block);
+
         Ok((root_block, root_quorum_cert, root_ledger_info))
     }
 
@@ -258,7 +219,7 @@ impl<T: Payload> RecoveryData<T> {
                 false
             }
         });
-        quorum_certs.retain(|qc| tree.contains(&qc.certified_block_id()));
+        quorum_certs.retain(|qc| tree.contains(&qc.certified_block().id()));
         to_remove
     }
 }
@@ -275,12 +236,9 @@ impl StorageWriteProxy {
 }
 
 impl PersistentLivenessStorage for StorageWriteProxy {
-    fn save_highest_timeout_cert(
-        &self,
-        highest_timeout_certs: HighestTimeoutCertificates,
-    ) -> Result<()> {
+    fn save_highest_timeout_cert(&self, highest_timeout_cert: TimeoutCertificate) -> Result<()> {
         self.db
-            .save_highest_timeout_certificates(to_vec_named(&highest_timeout_certs)?)
+            .save_highest_timeout_certificate(to_vec_named(&highest_timeout_cert)?)
     }
 }
 
@@ -303,37 +261,33 @@ impl<T: Payload> PersistentStorage<T> for StorageWriteProxy {
         Ok(())
     }
 
-    fn save_consensus_state(&self, state: ConsensusState) -> Result<()> {
-        self.db.save_state(to_vec_named(&state)?)
+    fn save_state(&self, vote: &Vote) -> Result<()> {
+        self.db.save_state(to_vec_named(vote)?)
     }
 
     fn start(config: &NodeConfig) -> (Arc<Self>, RecoveryData<T>) {
         info!("Start consensus recovery.");
         let read_client = create_storage_read_client(config);
-        let db = Arc::new(ConsensusDB::new(config.storage.dir.clone()));
+        let db = Arc::new(ConsensusDB::new(config.get_storage_dir()));
         let proxy = Arc::new(Self::new(Arc::clone(&db)));
         let initial_data = db.get_data().expect("unable to recover consensus data");
-        let consensus_state = initial_data.0.map_or_else(ConsensusState::default, |s| {
-            from_slice(&s[..]).expect("unable to deserialize consensus state")
+
+        let last_vote = initial_data.0.map(|vote_data| {
+            from_slice(&vote_data[..]).expect("unable to deserialize last vote msg")
         });
-        debug!("Recovered consensus state: {}", consensus_state);
-        let highest_timeout_certificates = initial_data
-            .1
-            .map_or_else(HighestTimeoutCertificates::default, |s| {
-                from_slice(&s[..]).expect("unable to deserialize highest timeout certificates")
-            });
-        let mut blocks = initial_data.2;
-        let mut quorum_certs: Vec<_> = initial_data.3;
-        // bootstrap the empty store with genesis block and qc.
-        if blocks.is_empty() && quorum_certs.is_empty() {
-            blocks.push(Block::make_genesis_block());
-            quorum_certs.push(QuorumCert::certificate_for_genesis());
-            proxy
-                .save_tree(vec![blocks[0].clone()], vec![quorum_certs[0].clone()])
-                .expect("unable to bootstrap the storage with genesis block");
-        }
+        let last_vote_repr = match &last_vote {
+            Some(vote) => format!("{}", vote),
+            None => "None".to_string(),
+        };
+        debug!("Recovered last vote msg: {}", last_vote_repr);
+
+        let highest_timeout_certificate = initial_data.1.map(|ts| {
+            from_slice(&ts[..]).expect("unable to deserialize highest timeout certificate")
+        });
+        let blocks = initial_data.2;
+        let quorum_certs: Vec<_> = initial_data.3;
         let blocks_repr: Vec<String> = blocks.iter().map(|b| format!("\n\t{}", b)).collect();
-        debug!(
+        info!(
             "The following blocks were restored from ConsensusDB : {}",
             blocks_repr.concat()
         );
@@ -341,40 +295,27 @@ impl<T: Payload> PersistentStorage<T> for StorageWriteProxy {
             .iter()
             .map(|qc| format!("\n\t{}", qc))
             .collect();
-        debug!(
-            "The following blocks were restored from ConsensusDB: {}",
+        info!(
+            "The following quorum certs were restored from ConsensusDB: {}",
             qc_repr.concat()
         );
 
         // find the block corresponding to storage latest ledger info
-        let (_, ledger_info, _) = read_client
+        let (_, ledger_info, _, _) = read_client
             .update_to_latest_ledger(0, vec![])
             .expect("unable to read ledger info from storage");
-        let root_from_storage = ledger_info.ledger_info().consensus_block_id();
-        debug!(
-            "The last committed block id as recorded in storage: {}",
-            root_from_storage
-        );
-
         let mut initial_data = RecoveryData::new(
-            consensus_state,
+            last_vote,
             blocks,
             quorum_certs,
-            root_from_storage,
-            highest_timeout_certificates,
+            ledger_info.ledger_info(),
+            highest_timeout_certificate,
         )
         .unwrap_or_else(|e| panic!("Can not construct recovery data due to {}", e));
 
         <dyn PersistentStorage<T>>::prune_tree(proxy.as_ref(), initial_data.take_blocks_to_prune())
             .expect("unable to prune dangling blocks during restart");
 
-        debug!("Consensus root to start with: {}", initial_data.root.0);
-
-        if initial_data.need_sync {
-            info!("Consensus recovery done but additional state synchronization is required.");
-        } else {
-            info!("Consensus recovery completed.")
-        }
         (proxy, initial_data)
     }
 }

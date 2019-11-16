@@ -27,17 +27,21 @@
 //! those structs translate to tables and table specifications.
 
 use crate::{
-    access::ModuleAccess,
-    check_bounds::BoundsChecker,
-    errors::{VMInvariantViolation, VerificationError},
-    internals::ModuleIndex,
+    access::ModuleAccess, check_bounds::BoundsChecker, internals::ModuleIndex, vm_string::VMString,
     IndexKind, SignatureTokenKind,
 };
-#[cfg(any(test, feature = "testing"))]
+use lazy_static::lazy_static;
+use libra_types::{
+    account_address::AccountAddress,
+    byte_array::ByteArray,
+    identifier::{IdentStr, Identifier},
+    language_storage::ModuleId,
+    vm_error::{StatusCode, VMStatus},
+};
+#[cfg(any(test, feature = "fuzzing"))]
 use proptest::{collection::vec, prelude::*, strategy::BoxedStrategy};
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
-use types::{account_address::AccountAddress, byte_array::ByteArray, language_storage::ModuleId};
 
 /// Generic index into one of the tables in the binary format.
 pub type TableIndex = u16;
@@ -49,8 +53,8 @@ macro_rules! define_index {
         doc: $comment: literal,
     } => {
         #[derive(Clone, Copy, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
-        #[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
-        #[cfg_attr(any(test, feature = "testing"), proptest(no_params))]
+        #[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+        #[cfg_attr(any(test, feature = "fuzzing"), proptest(no_params))]
         #[doc=$comment]
         pub struct $name(pub TableIndex);
 
@@ -100,9 +104,14 @@ define_index! {
     doc: "Index into the `FunctionHandle` table.",
 }
 define_index! {
-    name: StringPoolIndex,
-    kind: StringPool,
-    doc: "Index into the `StringPool` table.",
+    name: IdentifierIndex,
+    kind: Identifier,
+    doc: "Index into the `Identifier` table.",
+}
+define_index! {
+    name: UserStringIndex,
+    kind: UserString,
+    doc: "Index into the `UserString` (VM string) table.",
 }
 define_index! {
     name: ByteArrayPoolIndex,
@@ -155,8 +164,10 @@ pub type MemberCount = u16;
 /// the instruction stream.
 pub type CodeOffset = u16;
 
-/// The pool of identifiers and string literals.
-pub type StringPool = Vec<String>;
+/// The pool of identifiers.
+pub type IdentifierPool = Vec<Identifier>;
+/// The pool of string literals.
+pub type UserStringPool = Vec<VMString>;
 /// The pool of `ByteArray` literals.
 pub type ByteArrayPool = Vec<ByteArray>;
 /// The pool of `AccountAddress` literals.
@@ -173,9 +184,15 @@ pub type FunctionSignaturePool = Vec<FunctionSignature>;
 /// locals used and their types.
 pub type LocalsSignaturePool = Vec<LocalsSignature>;
 
-/// Name of the placeholder module. Every compiled script has an entry that
-/// refers to itself in its module handle list. This is the name of that script.
-pub const SELF_MODULE_NAME: &str = "<SELF>";
+// TODO: "<SELF>" only passes the validator for identifiers because it is special cased. Whenever
+// "<SELF>" is removed, so should the special case in identifier.rs.
+lazy_static! {
+    static ref SELF_MODULE_NAME: Identifier = Identifier::new("<SELF>").unwrap();
+}
+
+pub fn self_module_name() -> &'static IdentStr {
+    &*SELF_MODULE_NAME
+}
 
 /// Index 0 into the LocalsSignaturePool, which is guaranteed to be an empty list.
 /// Used to represent function/struct instantiation with no type actuals -- effectively
@@ -202,13 +219,13 @@ pub const NO_TYPE_ACTUALS: LocalsSignatureIndex = LocalsSignatureIndex(0);
 /// Type definitions (fields) are private to the module. Outside the module a
 /// Type is an opaque handle.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
-#[cfg_attr(any(test, feature = "testing"), proptest(no_params))]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "fuzzing"), proptest(no_params))]
 pub struct ModuleHandle {
     /// Index into the `AddressPool`. Identifies the account that holds the module.
     pub address: AddressPoolIndex,
     /// The name of the module published in the code section for the account in `address`.
-    pub name: StringPoolIndex,
+    pub name: IdentifierIndex,
 }
 
 /// A `StructHandle` is a reference to a user defined type. It is composed by a `ModuleHandle`
@@ -225,13 +242,13 @@ pub struct ModuleHandle {
 /// At link time kind checking is performed and an error is reported if there is a
 /// mismatch with the definition.
 #[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
-#[cfg_attr(any(test, feature = "testing"), proptest(no_params))]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "fuzzing"), proptest(no_params))]
 pub struct StructHandle {
     /// The module that defines the type.
     pub module: ModuleHandleIndex,
     /// The name of the type.
-    pub name: StringPoolIndex,
+    pub name: IdentifierIndex,
     /// There are two ways for a type to have the Kind resource
     /// 1) If it has a type argument of resource
     /// 2) If it was declared as a resource
@@ -251,13 +268,13 @@ pub struct StructHandle {
 /// ensure the function reference is valid and it is also used by the verifier to type check
 /// function calls.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
-#[cfg_attr(any(test, feature = "testing"), proptest(no_params))]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "fuzzing"), proptest(no_params))]
 pub struct FunctionHandle {
     /// The module that defines the function.
     pub module: ModuleHandleIndex,
     /// The name of the function.
-    pub name: StringPoolIndex,
+    pub name: IdentifierIndex,
     /// The signature of the function.
     pub signature: FunctionSignatureIndex,
 }
@@ -267,8 +284,8 @@ pub struct FunctionHandle {
 
 /// `StructFieldInformation` indicates whether a struct is native or has user-specified fields
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
-#[cfg_attr(any(test, feature = "testing"), proptest(no_params))]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "fuzzing"), proptest(no_params))]
 pub enum StructFieldInformation {
     Native,
     Declared {
@@ -283,8 +300,8 @@ pub enum StructFieldInformation {
 /// A `StructDefinition` is a type definition. It either indicates it is native or
 // defines all the user-specified fields declared on the type.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
-#[cfg_attr(any(test, feature = "testing"), proptest(no_params))]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "fuzzing"), proptest(no_params))]
 pub struct StructDefinition {
     /// The `StructHandle` for this `StructDefinition`. This has the name and the resource flag
     /// for the type.
@@ -296,10 +313,10 @@ pub struct StructDefinition {
 }
 
 impl StructDefinition {
-    pub fn declared_field_count(&self) -> Result<MemberCount, VMInvariantViolation> {
+    pub fn declared_field_count(&self) -> Result<MemberCount, VMStatus> {
         match &self.field_information {
             // TODO we might want a more informative error here
-            StructFieldInformation::Native => Err(VMInvariantViolation::LinkerError),
+            StructFieldInformation::Native => Err(VMStatus::new(StatusCode::LINKER_ERROR)),
             StructFieldInformation::Declared { field_count, .. } => Ok(*field_count),
         }
     }
@@ -307,13 +324,13 @@ impl StructDefinition {
 /// A `FieldDefinition` is the definition of a field: the type the field is defined on,
 /// its name and the field type.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
-#[cfg_attr(any(test, feature = "testing"), proptest(no_params))]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "fuzzing"), proptest(no_params))]
 pub struct FieldDefinition {
     /// The type (resource or unrestricted) the field is defined on.
     pub struct_: StructHandleIndex,
     /// The name of the field.
-    pub name: StringPoolIndex,
+    pub name: IdentifierIndex,
     /// The type of the field.
     pub signature: TypeSignatureIndex,
 }
@@ -321,8 +338,8 @@ pub struct FieldDefinition {
 /// A `FunctionDefinition` is the implementation of a function. It defines
 /// the *prototype* of the function and the function body.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
-#[cfg_attr(any(test, feature = "testing"), proptest(params = "usize"))]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "fuzzing"), proptest(params = "usize"))]
 pub struct FunctionDefinition {
     /// The prototype of the function (module, name, signature).
     pub function: FunctionHandleIndex,
@@ -340,7 +357,7 @@ pub struct FunctionDefinition {
     pub acquires_global_resources: Vec<StructDefinitionIndex>,
     /// Code for this function.
     #[cfg_attr(
-        any(test, feature = "testing"),
+        any(test, feature = "fuzzing"),
         proptest(strategy = "any_with::<CodeUnit>(params)")
     )]
     pub code: CodeUnit,
@@ -365,8 +382,8 @@ impl FunctionDefinition {
 /// A type definition. `SignatureToken` allows the definition of the set of known types and their
 /// composition.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
-#[cfg_attr(any(test, feature = "testing"), proptest(no_params))]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "fuzzing"), proptest(no_params))]
 pub struct TypeSignature(pub SignatureToken);
 
 /// A `FunctionSignature` describes the types of a function.
@@ -375,18 +392,18 @@ pub struct TypeSignature(pub SignatureToken);
 /// types and carries kind constraints for those type parameters (empty list for non-generic
 /// functions).
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
-#[cfg_attr(any(test, feature = "testing"), proptest(params = "usize"))]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "fuzzing"), proptest(params = "usize"))]
 pub struct FunctionSignature {
     /// The list of return types.
     #[cfg_attr(
-        any(test, feature = "testing"),
+        any(test, feature = "fuzzing"),
         proptest(strategy = "vec(any::<SignatureToken>(), 0..=params)")
     )]
     pub return_types: Vec<SignatureToken>,
     /// The list of arguments to the function.
     #[cfg_attr(
-        any(test, feature = "testing"),
+        any(test, feature = "fuzzing"),
         proptest(strategy = "vec(any::<SignatureToken>(), 0..=params)")
     )]
     pub arg_types: Vec<SignatureToken>,
@@ -399,11 +416,11 @@ pub struct FunctionSignature {
 /// Locals include the arguments to the function from position `0` to argument `count - 1`.
 /// The remaining elements are the type of each local.
 #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
-#[cfg_attr(any(test, feature = "testing"), proptest(params = "usize"))]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "fuzzing"), proptest(params = "usize"))]
 pub struct LocalsSignature(
     #[cfg_attr(
-        any(test, feature = "testing"),
+        any(test, feature = "fuzzing"),
         proptest(strategy = "vec(any::<SignatureToken>(), 0..=params)")
     )]
     pub Vec<SignatureToken>,
@@ -431,7 +448,7 @@ pub type TypeParameterIndex = u16;
 ///
 /// Currently there are three kinds in Move: `All`, `Resource` and `Unrestricted`.
 #[derive(Debug, Clone, Eq, Copy, Hash, Ord, PartialEq, PartialOrd)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
 pub enum Kind {
     /// Represents the super set of all types. The type might actually be a `Resource` or
     /// `Unrestricted` A type might be in this set if it is not known to be a `Resource` or
@@ -446,6 +463,29 @@ pub enum Kind {
     /// - `Unrestricted` values can be copied
     /// - `Unrestricted` values can be popped
     Unrestricted,
+}
+
+impl Kind {
+    /// Checks if the given kind is a sub-kind of another.
+    #[inline]
+    pub fn is_sub_kind_of(self, k: Kind) -> bool {
+        use Kind::*;
+
+        match (self, k) {
+            (_, All) | (Resource, Resource) | (Unrestricted, Unrestricted) => true,
+            _ => false,
+        }
+    }
+
+    /// Helper function to determine the kind of a struct instance by taking the kind of a type
+    /// actual and join it with the existing partial result.
+    pub fn join(self, other: &Kind) -> Kind {
+        match (self, other) {
+            (Kind::All, _) | (_, Kind::All) => Kind::All,
+            (Kind::Resource, _) | (_, Kind::Resource) => Kind::Resource,
+            (Kind::Unrestricted, Kind::Unrestricted) => Kind::Unrestricted,
+        }
+    }
 }
 
 /// A `SignatureToken` is a type declaration for a location.
@@ -478,7 +518,7 @@ pub enum SignatureToken {
 }
 
 /// `Arbitrary` for `SignatureToken` cannot be derived automatically as it's a recursive type.
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, feature = "fuzzing"))]
 impl Arbitrary for SignatureToken {
     type Strategy = BoxedStrategy<Self>;
     type Parameters = ();
@@ -549,6 +589,19 @@ impl SignatureToken {
         }
     }
 
+    /// Returns the type actuals if the signature token is a reference to a struct instance.
+    pub fn get_type_actuals_from_reference(&self) -> Option<&[SignatureToken]> {
+        use SignatureToken::*;
+
+        match self {
+            Reference(box_) | MutableReference(box_) => match &**box_ {
+                Struct(_, tys) => Some(&tys),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// Returns the "value kind" for the `SignatureToken`
     #[inline]
     pub fn signature_token_kind(&self) -> SignatureTokenKind {
@@ -560,7 +613,9 @@ impl SignatureToken {
             Reference(_) => SignatureTokenKind::Reference,
             MutableReference(_) => SignatureTokenKind::MutableReference,
             Bool | U64 | ByteArray | String | Address | Struct(_, _) => SignatureTokenKind::Value,
-            TypeParameter(_) => unimplemented!(),
+            // TODO: This is a temporary hack to please the verifier. SignatureTokenKind will soon
+            // be completely removed. `SignatureTokenView::kind()` should be used instead.
+            TypeParameter(_) => SignatureTokenKind::Value,
         }
     }
 
@@ -638,12 +693,79 @@ impl SignatureToken {
             ),
         }
     }
+
+    /// Creating a new type by Substituting the type variables with type actuals.
+    pub fn substitute(&self, tys: &[SignatureToken]) -> SignatureToken {
+        use SignatureToken::*;
+
+        match self {
+            Bool => Bool,
+            U64 => U64,
+            String => String,
+            ByteArray => ByteArray,
+            Address => Address,
+            Struct(idx, actuals) => Struct(
+                *idx,
+                actuals
+                    .iter()
+                    .map(|ty| ty.substitute(tys))
+                    .collect::<Vec<_>>(),
+            ),
+            Reference(ty) => Reference(Box::new(ty.substitute(tys))),
+            MutableReference(ty) => MutableReference(Box::new(ty.substitute(tys))),
+            TypeParameter(idx) => tys[*idx as usize].clone(),
+        }
+    }
+
+    /// Returns the kind of the signature token in the given context (module, function/struct).
+    /// The context is needed to determine the kinds of structs & type variables.
+    pub fn kind(
+        (struct_handles, type_formals): (&[StructHandle], &[Kind]),
+        ty: &SignatureToken,
+    ) -> Kind {
+        use SignatureToken::*;
+
+        match ty {
+            // The primitive types & references have kind unrestricted.
+            Bool | U64 | String | ByteArray | Address | Reference(_) | MutableReference(_) => {
+                Kind::Unrestricted
+            }
+
+            // To get the kind of a type parameter, we lookup its constraint in the formals.
+            TypeParameter(idx) => type_formals[*idx as usize],
+
+            Struct(idx, tys) => {
+                // Get the struct handle at idx. Note the index could be out of bounds.
+                let sh = &struct_handles[idx.0 as usize];
+
+                if sh.is_nominal_resource {
+                    return Kind::Resource;
+                }
+
+                // Gather the kinds of the type actuals.
+                let kinds = tys
+                    .iter()
+                    .map(|ty| Self::kind((struct_handles, type_formals), ty))
+                    .collect::<Vec<_>>();
+
+                // Derive the kind of the struct.
+                //   - If any of the type actuals has kind `all`, then the struct has kind `all`.
+                //     - `all` means some part of the type can be either `resource` or
+                //       `unrestricted`.
+                //     - Therefore it is also impossible to determine the kind of the type as a
+                //       whole, and thus `all`.
+                //   - If none of the type actuals has kind `all`, then the struct is a resource if
+                //     and only if one of the type actuals has kind `resource`.
+                kinds.iter().fold(Kind::Unrestricted, Kind::join)
+            }
+        }
+    }
 }
 
 /// A `CodeUnit` is the body of a function. It has the function header and the instruction stream.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
-#[cfg_attr(any(test, feature = "testing"), proptest(params = "usize"))]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "fuzzing"), proptest(params = "usize"))]
 pub struct CodeUnit {
     /// Max stack size for the function - currently unused.
     pub max_stack_size: u16,
@@ -651,7 +773,7 @@ pub struct CodeUnit {
     pub locals: LocalsSignatureIndex,
     /// Code stream, function body.
     #[cfg_attr(
-        any(test, feature = "testing"),
+        any(test, feature = "fuzzing"),
         proptest(strategy = "vec(any::<Bytecode>(), 0..=params)")
     )]
     pub code: Vec<Bytecode>,
@@ -671,8 +793,8 @@ impl CodeUnit {
 /// Bytecodes operate on a stack machine and each bytecode has side effect on the stack and the
 /// instruction stream.
 #[derive(Clone, Hash, Eq, PartialEq)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
-#[cfg_attr(any(test, feature = "testing"), proptest(no_params))]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Arbitrary))]
+#[cfg_attr(any(test, feature = "fuzzing"), proptest(no_params))]
 pub enum Bytecode {
     /// Pop and discard the value at the top of the stack.
     /// The value on the stack must be an unrestricted type.
@@ -715,13 +837,13 @@ pub enum Bytecode {
     ///
     /// ```... -> ..., u64_value```
     LdConst(u64),
-    /// Push a `string` literal onto the stack. The string is loaded from the `StringPool` via
-    /// `StringPoolIndex`.
+    /// Push a string literal onto the stack. The string is loaded from the `UserStrings` via
+    /// `UserStringIndex`.
     ///
     /// Stack transition:
     ///
     /// ```... -> ..., string_value```
-    LdStr(StringPoolIndex),
+    LdStr(UserStringIndex),
     /// Push a `ByteArray` literal onto the stack. The `ByteArray` is loaded from the
     /// `ByteArrayPool` via `ByteArrayPoolIndex`.
     ///
@@ -858,14 +980,22 @@ pub enum Bytecode {
     ///
     /// ```..., reference -> ..., field_reference```
     ImmBorrowField(FieldDefinitionIndex),
-    /// Return reference to an instance of type `StructDefinitionIndex` published at the address
-    /// passed as argument. Abort execution if such an object does not exist or if a reference
-    /// has already been handed out.
+    /// Return a mutable reference to an instance of type `StructDefinitionIndex` published at the
+    /// address passed as argument. Abort execution if such an object does not exist or if a
+    /// reference has already been handed out.
     ///
     /// Stack transition:
     ///
     /// ```..., address_value -> ..., reference_value```
-    BorrowGlobal(StructDefinitionIndex, LocalsSignatureIndex),
+    MutBorrowGlobal(StructDefinitionIndex, LocalsSignatureIndex),
+    /// Return an immutable reference to an instance of type `StructDefinitionIndex` published at
+    /// the address passed as argument. Abort execution if such an object does not exist or if a
+    /// reference has already been handed out.
+    ///
+    /// Stack transition:
+    ///
+    /// ```..., address_value -> ..., reference_value```
+    ImmBorrowGlobal(StructDefinitionIndex, LocalsSignatureIndex),
     /// Add the 2 u64 at the top of the stack and pushes the result on the stack.
     /// The operation aborts the transaction in case of overflow.
     ///
@@ -1032,14 +1162,8 @@ pub enum Bytecode {
     ///
     /// Stack transition:
     ///
-    /// ```..., address_value -> ...```
+    /// ```..., value -> ...```
     MoveToSender(StructDefinitionIndex, LocalsSignatureIndex),
-    /// Create an account at the address specified. Does not return anything.
-    ///
-    /// Stack transition:
-    ///
-    /// ```..., address_value -> ...```
-    CreateAccount,
     /// Get the sequence number submitted with the transaction and pushes it on the stack.
     ///
     /// Stack transition:
@@ -1058,6 +1182,8 @@ pub enum Bytecode {
 /// This is necessary for checking that all instructions are covered since Rust
 /// does not provide a way of determining the number of variants of an enum.
 pub const NUMBER_OF_BYTECODE_INSTRUCTIONS: usize = 53;
+
+pub const NUMBER_OF_NATIVE_FUNCTIONS: usize = 17;
 
 impl ::std::fmt::Debug for Bytecode {
     fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
@@ -1086,7 +1212,8 @@ impl ::std::fmt::Debug for Bytecode {
             Bytecode::ImmBorrowLoc(a) => write!(f, "ImmBorrowLoc({})", a),
             Bytecode::MutBorrowField(a) => write!(f, "MutBorrowField({})", a),
             Bytecode::ImmBorrowField(a) => write!(f, "ImmBorrowField({})", a),
-            Bytecode::BorrowGlobal(a, b) => write!(f, "BorrowGlobal({}, {:?})", a, b),
+            Bytecode::MutBorrowGlobal(a, b) => write!(f, "MutBorrowGlobal({}, {:?})", a, b),
+            Bytecode::ImmBorrowGlobal(a, b) => write!(f, "ImmBorrowGlobal({}, {:?})", a, b),
             Bytecode::Add => write!(f, "Add"),
             Bytecode::Sub => write!(f, "Sub"),
             Bytecode::Mul => write!(f, "Mul"),
@@ -1112,7 +1239,6 @@ impl ::std::fmt::Debug for Bytecode {
             Bytecode::Exists(a, b) => write!(f, "Exists({}, {:?})", a, b),
             Bytecode::MoveFrom(a, b) => write!(f, "MoveFrom({}, {:?})", a, b),
             Bytecode::MoveToSender(a, b) => write!(f, "MoveToSender({}, {:?})", a, b),
-            Bytecode::CreateAccount => write!(f, "CreateAccount"),
             Bytecode::GetTxnSequenceNumber => write!(f, "GetTxnSequenceNumber"),
             Bytecode::GetTxnPublicKey => write!(f, "GetTxnPublicKey"),
         }
@@ -1217,72 +1343,32 @@ pub struct CompiledScript(CompiledScriptMut);
 /// A mutable version of `CompiledScript`. Converting to a `CompiledScript` requires this to pass
 /// the bounds checker.
 #[derive(Clone, Default, Eq, PartialEq, Debug)]
-#[cfg_attr(any(test, feature = "testing"), derive(Arbitrary))]
-#[cfg_attr(any(test, feature = "testing"), proptest(params = "usize"))]
 pub struct CompiledScriptMut {
     /// Handles to all modules referenced.
-    #[cfg_attr(
-        any(test, feature = "testing"),
-        proptest(strategy = "vec(any::<ModuleHandle>(), 0..=params)")
-    )]
     pub module_handles: Vec<ModuleHandle>,
     /// Handles to external/imported types.
-    #[cfg_attr(
-        any(test, feature = "testing"),
-        proptest(strategy = "vec(any::<StructHandle>(), 0..=params)")
-    )]
     pub struct_handles: Vec<StructHandle>,
     /// Handles to external/imported functions.
-    #[cfg_attr(
-        any(test, feature = "testing"),
-        proptest(strategy = "vec(any::<FunctionHandle>(), 0..=params)")
-    )]
     pub function_handles: Vec<FunctionHandle>,
 
     /// Type pool. All external types referenced by the transaction.
-    #[cfg_attr(
-        any(test, feature = "testing"),
-        proptest(strategy = "vec(any::<TypeSignature>(), 0..=params)")
-    )]
     pub type_signatures: TypeSignaturePool,
     /// Function signature pool. The signatures of the function referenced by the transaction.
-    #[cfg_attr(
-        any(test, feature = "testing"),
-        proptest(strategy = "vec(any_with::<FunctionSignature>(params), 0..=params)")
-    )]
     pub function_signatures: FunctionSignaturePool,
     /// Locals signature pool. The signature of the locals in `main`.
-    #[cfg_attr(
-        any(test, feature = "testing"),
-        proptest(strategy = "vec(any_with::<LocalsSignature>(params), 0..=params)")
-    )]
     pub locals_signatures: LocalsSignaturePool,
 
-    /// String pool. All literals and identifiers used in this transaction.
-    #[cfg_attr(
-        any(test, feature = "testing"),
-        proptest(strategy = "vec(\".*\", 0..=params)")
-    )]
-    pub string_pool: StringPool,
+    /// All identifiers used in this transaction.
+    pub identifiers: IdentifierPool,
+    /// User strings. All literals used in this transaction.
+    pub user_strings: UserStringPool,
     /// ByteArray pool. The byte array literals used in the transaction.
-    #[cfg_attr(
-        any(test, feature = "testing"),
-        proptest(strategy = "vec(any::<ByteArray>(), 0..=params)")
-    )]
     pub byte_array_pool: ByteArrayPool,
     /// Address pool. The address literals used in the module. Those include literals for
     /// code references (`ModuleHandle`).
-    #[cfg_attr(
-        any(test, feature = "testing"),
-        proptest(strategy = "vec(any::<AccountAddress>(), 0..=params)")
-    )]
     pub address_pool: AddressPool,
 
     /// The main (script) to execute.
-    #[cfg_attr(
-        any(test, feature = "testing"),
-        proptest(strategy = "any_with::<FunctionDefinition>(params)")
-    )]
     pub main: FunctionDefinition,
 }
 
@@ -1314,7 +1400,7 @@ impl CompiledScript {
 impl CompiledScriptMut {
     /// Converts this instance into `CompiledScript` after verifying it for basic internal
     /// consistency. This includes bounds checks but no others.
-    pub fn freeze(self) -> Result<CompiledScript, Vec<VerificationError>> {
+    pub fn freeze(self) -> Result<CompiledScript, Vec<VMStatus>> {
         let fake_module = self.into_module();
         Ok(fake_module.freeze()?.into_script())
     }
@@ -1331,7 +1417,8 @@ impl CompiledScriptMut {
             function_signatures: self.function_signatures,
             locals_signatures: self.locals_signatures,
 
-            string_pool: self.string_pool,
+            identifiers: self.identifiers,
+            user_strings: self.user_strings,
             byte_array_pool: self.byte_array_pool,
             address_pool: self.address_pool,
 
@@ -1371,8 +1458,10 @@ pub struct CompiledModuleMut {
     /// the module.
     pub locals_signatures: LocalsSignaturePool,
 
-    /// String pool. All literals and identifiers used in the module.
-    pub string_pool: StringPool,
+    /// All identifiers used in this module.
+    pub identifiers: IdentifierPool,
+    /// User strings. All literals used in this module.
+    pub user_strings: UserStringPool,
     /// ByteArray pool. The byte array literals used in the module.
     pub byte_array_pool: ByteArrayPool,
     /// Address pool. The address literals used in the module. Those include literals for
@@ -1389,7 +1478,59 @@ pub struct CompiledModuleMut {
 
 // Need a custom implementation of Arbitrary because as of proptest-derive 0.1.1, the derivation
 // doesn't work for structs with more than 10 fields.
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, feature = "fuzzing"))]
+impl Arbitrary for CompiledScriptMut {
+    type Strategy = BoxedStrategy<Self>;
+    /// The size of the compiled script.
+    type Parameters = usize;
+
+    fn arbitrary_with(size: Self::Parameters) -> Self::Strategy {
+        (
+            (
+                vec(any::<ModuleHandle>(), 0..=size),
+                vec(any::<StructHandle>(), 0..=size),
+                vec(any::<FunctionHandle>(), 0..=size),
+            ),
+            (
+                vec(any::<TypeSignature>(), 0..=size),
+                vec(any_with::<FunctionSignature>(size), 0..=size),
+                vec(any_with::<LocalsSignature>(size), 0..=size),
+            ),
+            (
+                vec(any::<Identifier>(), 0..=size),
+                vec(any::<VMString>(), 0..=size),
+                vec(any::<ByteArray>(), 0..=size),
+                vec(any::<AccountAddress>(), 0..=size),
+            ),
+            any_with::<FunctionDefinition>(size),
+        )
+            .prop_map(
+                |(
+                    (module_handles, struct_handles, function_handles),
+                    (type_signatures, function_signatures, locals_signatures),
+                    (identifiers, user_strings, byte_array_pool, address_pool),
+                    main,
+                )| {
+                    CompiledScriptMut {
+                        module_handles,
+                        struct_handles,
+                        function_handles,
+                        type_signatures,
+                        function_signatures,
+                        locals_signatures,
+                        identifiers,
+                        user_strings,
+                        byte_array_pool,
+                        address_pool,
+                        main,
+                    }
+                },
+            )
+            .boxed()
+    }
+}
+
+#[cfg(any(test, feature = "fuzzing"))]
 impl Arbitrary for CompiledModuleMut {
     type Strategy = BoxedStrategy<Self>;
     /// The size of the compiled module.
@@ -1408,7 +1549,8 @@ impl Arbitrary for CompiledModuleMut {
                 vec(any_with::<LocalsSignature>(size), 0..=size),
             ),
             (
-                vec(any::<String>(), 0..=size),
+                vec(any::<Identifier>(), 0..=size),
+                vec(any::<VMString>(), 0..=size),
                 vec(any::<ByteArray>(), 0..=size),
                 vec(any::<AccountAddress>(), 0..=size),
             ),
@@ -1422,7 +1564,7 @@ impl Arbitrary for CompiledModuleMut {
                 |(
                     (module_handles, struct_handles, function_handles),
                     (type_signatures, function_signatures, locals_signatures),
-                    (string_pool, byte_array_pool, address_pool),
+                    (identifiers, user_strings, byte_array_pool, address_pool),
                     (struct_defs, field_defs, function_defs),
                 )| {
                     CompiledModuleMut {
@@ -1432,7 +1574,8 @@ impl Arbitrary for CompiledModuleMut {
                         type_signatures,
                         function_signatures,
                         locals_signatures,
-                        string_pool,
+                        identifiers,
+                        user_strings,
                         byte_array_pool,
                         address_pool,
                         struct_defs,
@@ -1458,19 +1601,20 @@ impl CompiledModuleMut {
             IndexKind::TypeSignature => self.type_signatures.len(),
             IndexKind::FunctionSignature => self.function_signatures.len(),
             IndexKind::LocalsSignature => self.locals_signatures.len(),
-            IndexKind::StringPool => self.string_pool.len(),
+            IndexKind::Identifier => self.identifiers.len(),
+            IndexKind::UserString => self.user_strings.len(),
             IndexKind::ByteArrayPool => self.byte_array_pool.len(),
             IndexKind::AddressPool => self.address_pool.len(),
             // XXX these two don't seem to belong here
-            other @ IndexKind::LocalPool | other @ IndexKind::CodeDefinition => {
-                panic!("invalid kind for count: {:?}", other)
-            }
+            other @ IndexKind::LocalPool
+            | other @ IndexKind::CodeDefinition
+            | other @ IndexKind::TypeParameter => panic!("invalid kind for count: {:?}", other),
         }
     }
 
     /// Converts this instance into `CompiledModule` after verifying it for basic internal
     /// consistency. This includes bounds checks but no others.
-    pub fn freeze(self) -> Result<CompiledModule, Vec<VerificationError>> {
+    pub fn freeze(self) -> Result<CompiledModule, Vec<VMStatus>> {
         let errors = BoundsChecker::new(&self).verify();
         if errors.is_empty() {
             Ok(CompiledModule(self))
@@ -1504,7 +1648,7 @@ impl CompiledModule {
     pub fn module_id_for_handle(&self, module_handle: &ModuleHandle) -> ModuleId {
         ModuleId::new(
             *self.address_at(module_handle.address),
-            self.string_at(module_handle.name).to_string(),
+            self.identifier_at(module_handle.name).to_owned(),
         )
     }
 
@@ -1528,7 +1672,8 @@ impl CompiledModule {
             function_signatures: inner.function_signatures,
             locals_signatures: inner.locals_signatures,
 
-            string_pool: inner.string_pool,
+            identifiers: inner.identifiers,
+            user_strings: inner.user_strings,
             byte_array_pool: inner.byte_array_pool,
             address_pool: inner.address_pool,
 
@@ -1542,10 +1687,11 @@ pub fn empty_module() -> CompiledModuleMut {
     CompiledModuleMut {
         module_handles: vec![ModuleHandle {
             address: AddressPoolIndex::new(0),
-            name: StringPoolIndex::new(0),
+            name: IdentifierIndex::new(0),
         }],
         address_pool: vec![AccountAddress::default()],
-        string_pool: vec![SELF_MODULE_NAME.to_string()],
+        identifiers: vec![self_module_name().to_owned()],
+        user_strings: vec![],
         function_defs: vec![],
         struct_defs: vec![],
         field_defs: vec![],
@@ -1556,6 +1702,71 @@ pub fn empty_module() -> CompiledModuleMut {
         locals_signatures: vec![LocalsSignature(vec![])],
         byte_array_pool: vec![],
     }
+}
+
+/// Create the following module which is convenient in tests:
+/// // module <SELF> {
+/// //     struct Bar { x: u64 }
+/// //
+/// //     foo() {
+/// //     }
+/// // }
+pub fn basic_test_module() -> CompiledModuleMut {
+    let mut m = empty_module();
+
+    m.function_signatures.push(FunctionSignature {
+        return_types: vec![],
+        arg_types: vec![],
+        type_formals: vec![],
+    });
+
+    m.function_handles.push(FunctionHandle {
+        module: ModuleHandleIndex::new(0),
+        name: IdentifierIndex::new(m.identifiers.len() as u16),
+        signature: FunctionSignatureIndex::new(0),
+    });
+    m.identifiers
+        .push(Identifier::new("foo".to_string()).unwrap());
+
+    m.function_defs.push(FunctionDefinition {
+        function: FunctionHandleIndex::new(0),
+        flags: 0,
+        acquires_global_resources: vec![],
+        code: CodeUnit {
+            max_stack_size: 0,
+            locals: LocalsSignatureIndex::new(0),
+            code: vec![],
+        },
+    });
+
+    m.struct_handles.push(StructHandle {
+        module: ModuleHandleIndex::new(0),
+        name: IdentifierIndex::new(m.identifiers.len() as u16),
+        is_nominal_resource: false,
+        type_formals: vec![],
+    });
+    m.identifiers
+        .push(Identifier::new("Bar".to_string()).unwrap());
+
+    m.struct_defs.push(StructDefinition {
+        struct_handle: StructHandleIndex::new(0),
+        field_information: StructFieldInformation::Declared {
+            field_count: 1,
+            fields: FieldDefinitionIndex::new(0),
+        },
+    });
+
+    m.field_defs.push(FieldDefinition {
+        struct_: StructHandleIndex::new(0),
+        name: IdentifierIndex::new(m.identifiers.len() as u16),
+        signature: TypeSignatureIndex::new(0),
+    });
+    m.identifiers
+        .push(Identifier::new("x".to_string()).unwrap());
+
+    m.type_signatures.push(TypeSignature(SignatureToken::U64));
+
+    m
 }
 
 /// Create a dummy module to wrap the bytecode program in local@code
@@ -1573,7 +1784,7 @@ pub fn dummy_procedure_module(code: Vec<Bytecode>) -> CompiledModule {
     });
     let fun_handle = FunctionHandle {
         module: ModuleHandleIndex(0),
-        name: StringPoolIndex(0),
+        name: IdentifierIndex(0),
         signature: FunctionSignatureIndex(0),
     };
 

@@ -1,5 +1,5 @@
-// check: VerificationError
-// check: BorrowLocExistsBorrowError
+// check: VerificationFailure
+// check: CALL_BORROWED_MUTABLE_REFERENCE_ERROR
 
 module Tester {
     struct T{v: u64}
