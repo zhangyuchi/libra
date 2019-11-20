@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{aws::Aws, cluster::Cluster};
-use failure::prelude::format_err;
+use failure::prelude::{bail, format_err};
 use retry::{delay::Fixed, retry};
 use rusoto_core::RusotoError;
 use rusoto_ecr::{
@@ -51,10 +51,13 @@ impl DeploymentManager {
     }
 
     pub fn latest_hash_changed(&self) -> Option<String> {
-        let hash = self.image_digest_by_tag(SOURCE_TAG);
-        let last_tested = self.image_digest_by_tag(TESTED_TAG);
+        let hash = self
+            .image_digest_by_tag(SOURCE_TAG)
+            .expect("Failed to get image digest for SOURCE_TAG");
+        let last_tested = self
+            .image_digest_by_tag(TESTED_TAG)
+            .expect("Failed to get image digest for TESTED_TAG");
         if hash == last_tested {
-            info!("Last deployed digest matches latest digest we expect, not doing redeploy");
             return None;
         }
         Some(hash)
@@ -95,16 +98,18 @@ impl DeploymentManager {
         Ok(())
     }
 
-    fn image_digest_by_tag(&self, tag: &str) -> String {
+    fn image_digest_by_tag(&self, tag: &str) -> failure::Result<String> {
         let result = self.describe_images(tag);
         let images = result
             .image_details
-            .expect("No image_details in ECR response");
+            .ok_or_else(|| format_err!("No image_details in ECR response"))?;
         if images.len() != 1 {
-            panic!("Ecr returned {} images for libra_e2e:nightly", images.len());
+            bail!("Ecr returned {} images for libra_e2e:nightly", images.len());
         }
         let image = images.into_iter().next().unwrap();
-        image.image_digest.expect("No image_digest")
+        image
+            .image_digest
+            .ok_or_else(|| format_err!("No image_digest"))
     }
 
     fn describe_images(&self, tag: &str) -> DescribeImagesResponse {
@@ -133,7 +138,9 @@ impl DeploymentManager {
     }
 
     pub fn get_tested_upstream_commit(&self) -> failure::Result<String> {
-        let digest = self.image_digest_by_tag(TESTED_TAG);
+        let digest = self
+            .image_digest_by_tag(TESTED_TAG)
+            .map_err(|e| format_err!("Failed to get image digest for {}:{}", TESTED_TAG, e))?;
         let prev_upstream_tag = self.get_upstream_tag(&digest)?;
         Ok(prev_upstream_tag[UPSTREAM_PREFIX.len()..].to_string())
     }
@@ -172,20 +179,24 @@ impl DeploymentManager {
             image_tag: None,
         };
         let images = self.get_images(VALIDATOR_IMAGE_REPO, &image_id)?;
-        for image in images {
-            let image_id = match image.image_id {
+        for image in &images {
+            let image_id = match &image.image_id {
                 Some(image_id) => image_id,
                 None => continue,
             };
-            let tag = match image_id.image_tag {
+            let tag = match &image_id.image_tag {
                 Some(tag) => tag,
                 None => continue,
             };
             if tag.starts_with(UPSTREAM_PREFIX) {
-                return Ok(tag);
+                return Ok(tag.clone());
             }
         }
-        Err(format_err!("Failed to find upstream tag"))
+        Err(format_err!(
+            "Failed to find upstream tag for {}. Images: {:?}",
+            digest,
+            images
+        ))
     }
 
     fn get_images(
@@ -250,6 +261,14 @@ impl DeploymentManager {
             }
         } else {
             Ok(())
+        }
+    }
+
+    pub fn resolve(&self, hash_or_tag: &str) -> failure::Result<String> {
+        if hash_or_tag.starts_with("sha256:") {
+            Ok(hash_or_tag.to_string())
+        } else {
+            self.image_digest_by_tag(hash_or_tag)
         }
     }
 }

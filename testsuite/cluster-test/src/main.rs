@@ -196,9 +196,13 @@ pub fn main() {
 
     let mut runner = ClusterTestRunner::setup(&args);
 
-    if let Some(ref deploy_hash) = args.deploy {
+    if let Some(ref hash_or_tag) = args.deploy {
         // Deploy deploy_hash before running whatever command
-        exit_on_error(runner.redeploy(deploy_hash));
+        let hash = runner
+            .deployment_manager
+            .resolve(hash_or_tag)
+            .expect("Failed to resolve tag");
+        exit_on_error(runner.redeploy(&hash));
     }
 
     if args.run {
@@ -568,7 +572,7 @@ impl ClusterTestRunner {
             let prev_commit = self
                 .deployment_manager
                 .get_tested_upstream_commit()
-                .map_err(|e| warn!("Failed to get prev_commit: {:?}", e))
+                .map_err(|e| warn!("Failed to get prev_commit: {}", e))
                 .ok();
             let upstream_commit = match self
                 .deployment_manager
@@ -594,26 +598,43 @@ impl ClusterTestRunner {
     pub fn run_suite_in_loop(&mut self) {
         self.cleanup();
         loop {
-            let hash_to_tag;
-            if let Some(hash) = self.deployment_manager.latest_hash_changed() {
-                info!(
-                    "New version of `{}` tag is available: `{}`",
-                    SOURCE_TAG, hash
-                );
-                match self.redeploy(&hash) {
-                    Err(e) => {
-                        self.report_failure(format!("Failed to deploy `{}`: {}", hash, e));
-                        return;
-                    }
-                    Ok(()) => {
-                        info!("Deployed new version `{}`, running test suite", hash);
-                        hash_to_tag = Some(hash);
-                    }
-                }
-                if let Err(e) = self.run_ci_suite(hash_to_tag) {
-                    self.report_failure(format!("{}", e));
+            let hash = self.wait_for_new_tag();
+            let upstream_tag = self
+                .deployment_manager
+                .get_upstream_tag(&hash)
+                .unwrap_or_else(|e| {
+                    warn!("Failed to get upstream tag for {}: {}", hash, e);
+                    "<unknown tag>".to_string()
+                });
+            info!(
+                "New version of `{}` tag({}) is available: `{}`",
+                SOURCE_TAG, upstream_tag, hash
+            );
+            match self.redeploy(&hash) {
+                Err(e) => {
+                    self.report_failure(format!("Failed to deploy `{}`: {}", hash, e));
                     return;
                 }
+                Ok(()) => {
+                    info!("Deployed new version `{}`, running test suite", hash);
+                }
+            }
+            if let Err(e) = self.run_ci_suite(Some(hash)) {
+                self.report_failure(format!("{}", e));
+                return;
+            }
+        }
+    }
+
+    fn wait_for_new_tag(&self) -> String {
+        let mut first = true;
+        loop {
+            if let Some(hash) = self.deployment_manager.latest_hash_changed() {
+                return hash;
+            }
+            if first {
+                info!("Last deployed digest matches latest digest we expect, not doing redeploy");
+                first = false;
             }
             thread::sleep(Duration::from_secs(60));
         }
@@ -975,7 +996,7 @@ impl ClusterTestRunner {
                         .ok();
                     instance
                         .run_cmd_tee_err(vec![format!(
-                            "test -f {f} && sudo gzip -S {s} {f}",
+                            "! test -f {f} || (sudo timeout 45 gzip -S {s} {f} || (echo gzip failed; sudo rm -f {f}))",
                             f = log_file,
                             s = suffix
                         )])
