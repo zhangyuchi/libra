@@ -6,26 +6,25 @@
 #![recursion_limit = "1024"]
 // </Black magic>
 
-// Public exports
-#[macro_use]
-extern crate prometheus;
-
-pub use common::NetworkPublicKeys;
 pub use interface::NetworkProvider;
 
+pub mod connectivity_manager;
+pub mod constants;
+pub mod counters;
+pub mod error;
 pub mod interface;
-pub mod proto;
+pub mod logging;
+pub mod noise;
+pub mod peer;
+pub mod peer_manager;
 pub mod protocols;
-pub mod validator_network;
+pub mod transport;
 
-mod common;
-mod connectivity_manager;
-mod counters;
-mod error;
-mod peer_manager;
-mod sink;
-mod transport;
-mod utils;
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing;
+#[cfg(any(test, feature = "testing", feature = "fuzzing"))]
+pub mod testutils;
 
-/// Type for unique identifier associated with each network protocol
-pub type ProtocolId = bytes::Bytes;
+pub type DisconnectReason = peer::DisconnectReason;
+pub type ConnectivityRequest = connectivity_manager::ConnectivityRequest;
+pub type ProtocolId = protocols::wire::handshake::v1::ProtocolId;

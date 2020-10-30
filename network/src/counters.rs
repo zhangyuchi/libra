@@ -1,125 +1,454 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use lazy_static;
-use libra_metrics::{Histogram, IntGauge, OpMetrics};
-use prometheus::{HistogramVec, IntCounterVec, IntGaugeVec};
+use crate::protocols::wire::handshake::v1::ProtocolId;
+use libra_config::network_id::NetworkContext;
+use libra_metrics::{
+    register_histogram_vec, register_int_counter_vec, register_int_gauge, register_int_gauge_vec,
+    Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge, IntGaugeVec,
+};
+use libra_types::PeerId;
+use netcore::transport::ConnectionOrigin;
+use once_cell::sync::Lazy;
 
-lazy_static::lazy_static! {
-    pub static ref LIBRA_NETWORK_PEERS: IntGaugeVec = register_int_gauge_vec!(
-        // metric name
+// some type labels
+pub const REQUEST_LABEL: &str = "request";
+pub const RESPONSE_LABEL: &str = "response";
+
+// some state labels
+pub const CANCELED_LABEL: &str = "canceled";
+pub const DECLINED_LABEL: &str = "declined";
+pub const RECEIVED_LABEL: &str = "received";
+pub const SENT_LABEL: &str = "sent";
+pub const SUCCEEDED_LABEL: &str = "succeeded";
+pub const FAILED_LABEL: &str = "failed";
+
+pub static LIBRA_NETWORK_PEERS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
         "libra_network_peers",
-        // metric description
-        "Libra network peers counter",
-        // metric labels (dimensions)
+        "Number of peers, and their associated state",
         &["role_type", "state"]
-    ).unwrap();
+    )
+    .unwrap()
+});
 
-    pub static ref LIBRA_NETWORK_RPC_MESSAGES: IntCounterVec = register_int_counter_vec!(
+pub static LIBRA_CONNECTIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "libra_connections",
+        "Number of current connections and their direction",
+        &["role_type", "network_id", "peer_id", "direction"]
+    )
+    .unwrap()
+});
+
+pub fn connections(network_context: &NetworkContext, origin: ConnectionOrigin) -> IntGauge {
+    LIBRA_CONNECTIONS.with_label_values(&[
+        network_context.role().as_str(),
+        network_context.network_id().as_str(),
+        network_context.peer_id().short_str().as_str(),
+        origin.as_str(),
+    ])
+}
+
+pub static LIBRA_NETWORK_PEER_CONNECTED: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "libra_network_peer_connected",
+        "Indicates if we are connected to a particular peer",
+        &["role_type", "network_id", "peer_id", "remote_peer_id"]
+    )
+    .unwrap()
+});
+
+pub fn peer_connected(network_context: &NetworkContext, remote_peer_id: &PeerId, v: i64) {
+    if network_context.role().is_validator() {
+        LIBRA_NETWORK_PEER_CONNECTED
+            .with_label_values(&[
+                network_context.role().as_str(),
+                network_context.network_id().as_str(),
+                network_context.peer_id().short_str().as_str(),
+                remote_peer_id.short_str().as_str(),
+            ])
+            .set(v)
+    }
+}
+
+/// Increments the counter based on `NetworkContext`
+pub fn inc_by_with_context(
+    counter: &IntCounterVec,
+    network_context: &NetworkContext,
+    label: &str,
+    val: i64,
+) {
+    counter
+        .with_label_values(&[
+            network_context.role().as_str(),
+            network_context.network_id().as_str(),
+            network_context.peer_id().short_str().as_str(),
+            label,
+        ])
+        .inc_by(val)
+}
+
+pub static LIBRA_NETWORK_PENDING_CONNECTION_UPGRADES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "libra_network_pending_connection_upgrades",
+        "Number of concurrent inbound or outbound connections we're currently negotiating",
+        &["role_type", "network_id", "peer_id", "direction"]
+    )
+    .unwrap()
+});
+
+pub fn pending_connection_upgrades(
+    network_context: &NetworkContext,
+    direction: ConnectionOrigin,
+) -> IntGauge {
+    LIBRA_NETWORK_PENDING_CONNECTION_UPGRADES.with_label_values(&[
+        network_context.role().as_str(),
+        network_context.network_id().as_str(),
+        network_context.peer_id().short_str().as_str(),
+        direction.as_str(),
+    ])
+}
+
+pub static LIBRA_NETWORK_CONNECTION_UPGRADE_TIME: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "libra_network_connection_upgrade_time_seconds",
+        "Time to complete a new inbound or outbound connection upgrade",
+        &["role_type", "network_id", "peer_id", "direction", "state"]
+    )
+    .unwrap()
+});
+
+pub fn connection_upgrade_time(
+    network_context: &NetworkContext,
+    direction: ConnectionOrigin,
+    state: &'static str,
+) -> Histogram {
+    LIBRA_NETWORK_CONNECTION_UPGRADE_TIME.with_label_values(&[
+        network_context.role().as_str(),
+        network_context.network_id().as_str(),
+        network_context.peer_id().short_str().as_str(),
+        direction.as_str(),
+        state,
+    ])
+}
+
+pub static LIBRA_NETWORK_DISCOVERY_NOTES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    register_int_gauge_vec!(
+        "libra_network_discovery_notes",
+        "Libra network discovery notes",
+        &["role_type"]
+    )
+    .unwrap()
+});
+
+pub static LIBRA_NETWORK_RPC_MESSAGES: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
         "libra_network_rpc_messages",
-        "Libra network rpc messages counter",
-        &["type", "state"]
-    ).unwrap();
+        "Number of RPC messages",
+        &["role_type", "network_id", "peer_id", "type", "state"]
+    )
+    .unwrap()
+});
 
-    pub static ref LIBRA_NETWORK_RPC_BYTES: HistogramVec = register_histogram_vec!(
+pub fn rpc_messages(
+    network_context: &NetworkContext,
+    type_label: &'static str,
+    state_label: &'static str,
+) -> IntCounter {
+    LIBRA_NETWORK_RPC_MESSAGES.with_label_values(&[
+        network_context.role().as_str(),
+        network_context.network_id().as_str(),
+        network_context.peer_id().short_str().as_str(),
+        type_label,
+        state_label,
+    ])
+}
+
+pub static LIBRA_NETWORK_RPC_BYTES: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
         "libra_network_rpc_bytes",
-        "Libra network rpc bytes histogram",
-        &["type", "state"]
-    ).unwrap();
+        "Number of RPC bytes transferred",
+        &["role_type", "network_id", "peer_id", "type", "state"]
+    )
+    .unwrap()
+});
 
-    pub static ref LIBRA_NETWORK_RPC_LATENCY: Histogram = register_histogram!(
-        "libra_network_rpc_latency_seconds",
-        "Libra network rpc latency histogram"
-    ).unwrap();
+pub fn rpc_bytes(
+    network_context: &NetworkContext,
+    type_label: &'static str,
+    state_label: &'static str,
+) -> IntCounter {
+    LIBRA_NETWORK_RPC_BYTES.with_label_values(&[
+        network_context.role().as_str(),
+        network_context.network_id().as_str(),
+        network_context.peer_id().short_str().as_str(),
+        type_label,
+        state_label,
+    ])
+}
 
-    pub static ref LIBRA_NETWORK_DIRECT_SEND_MESSAGES: IntCounterVec = register_int_counter_vec!(
+pub static INVALID_NETWORK_MESSAGES: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "libra_network_invalid_messages",
+        "Number of invalid messages (RPC/direct_send)",
+        &["role_type", "network_id", "peer_id", "type"]
+    )
+    .unwrap()
+});
+
+pub static PEER_SEND_FAILURES: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "libra_network_peer_send_failures",
+        "Number of messages failed to send to peer",
+        &["role_type", "network_id", "peer_id", "protocol_id"]
+    )
+    .unwrap()
+});
+
+pub static LIBRA_NETWORK_OUTBOUND_RPC_REQUEST_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "libra_network_outbound_rpc_request_latency_seconds",
+        "Outbound RPC request latency in seconds",
+        &["role_type", "network_id", "peer_id", "protocol_id"]
+    )
+    .unwrap()
+});
+
+pub fn outbound_rpc_request_latency(
+    network_context: &NetworkContext,
+    protocol_id: ProtocolId,
+) -> Histogram {
+    LIBRA_NETWORK_OUTBOUND_RPC_REQUEST_LATENCY.with_label_values(&[
+        network_context.role().as_str(),
+        network_context.network_id().as_str(),
+        network_context.peer_id().short_str().as_str(),
+        protocol_id.as_str(),
+    ])
+}
+
+pub static LIBRA_NETWORK_INBOUND_RPC_HANDLER_LATENCY: Lazy<HistogramVec> = Lazy::new(|| {
+    register_histogram_vec!(
+        "libra_network_inbound_rpc_handler_latency_seconds",
+        "Inbound RPC request application handler latency in seconds",
+        &["role_type", "network_id", "peer_id", "protocol_id"]
+    )
+    .unwrap()
+});
+
+pub fn inbound_rpc_handler_latency(
+    network_context: &NetworkContext,
+    protocol_id: ProtocolId,
+) -> Histogram {
+    LIBRA_NETWORK_INBOUND_RPC_HANDLER_LATENCY.with_label_values(&[
+        network_context.role().as_str(),
+        network_context.network_id().as_str(),
+        network_context.peer_id().short_str().as_str(),
+        protocol_id.as_str(),
+    ])
+}
+
+pub static LIBRA_NETWORK_DIRECT_SEND_MESSAGES: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
         "libra_network_direct_send_messages",
-        "Libra network direct send messages counter",
-        &["state"]
-    ).unwrap();
+        "Number of direct send messages",
+        &["role_type", "network_id", "peer_id", "state"]
+    )
+    .unwrap()
+});
 
-    pub static ref LIBRA_NETWORK_DIRECT_SEND_BYTES: HistogramVec = register_histogram_vec!(
+pub fn direct_send_messages(
+    network_context: &NetworkContext,
+    state_label: &'static str,
+) -> IntCounter {
+    LIBRA_NETWORK_DIRECT_SEND_MESSAGES.with_label_values(&[
+        network_context.role().as_str(),
+        network_context.network_id().as_str(),
+        network_context.peer_id().short_str().as_str(),
+        state_label,
+    ])
+}
+
+pub static LIBRA_NETWORK_DIRECT_SEND_BYTES: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
         "libra_network_direct_send_bytes",
-        "Libra network direct send bytes histogram",
+        "Number of direct send bytes transferred",
+        &["role_type", "network_id", "peer_id", "state"]
+    )
+    .unwrap()
+});
+
+pub fn direct_send_bytes(
+    network_context: &NetworkContext,
+    state_label: &'static str,
+) -> IntCounter {
+    LIBRA_NETWORK_DIRECT_SEND_BYTES.with_label_values(&[
+        network_context.role().as_str(),
+        network_context.network_id().as_str(),
+        network_context.peer_id().short_str().as_str(),
+        state_label,
+    ])
+}
+
+/// Counters(queued,dequeued,dropped) related to inbound network notifications for RPCs and
+/// DirectSends.
+pub static PENDING_NETWORK_NOTIFICATIONS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "libra_network_pending_network_notifications",
+        "Number of pending inbound network notifications by state",
         &["state"]
-    ).unwrap();
-}
+    )
+    .unwrap()
+});
 
-lazy_static::lazy_static! {
-    pub static ref OP_COUNTERS: OpMetrics = OpMetrics::new_and_registered("network");
-}
+/// Counter of pending requests in Network Provider
+pub static PENDING_NETWORK_REQUESTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "libra_network_pending_requests",
+        "Number of pending outbound network requests by state",
+        &["state"]
+    )
+    .unwrap()
+});
 
-lazy_static::lazy_static! {
-    ///
-    /// Channel Counters
-    ///
+/// Counter of pending network events to Health Checker.
+pub static PENDING_HEALTH_CHECKER_NETWORK_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "libra_network_pending_health_check_events",
+        "Number of pending health check events by state",
+        &["state"]
+    )
+    .unwrap()
+});
 
-    /// Counter of pending requests in Network Provider
-    pub static ref PENDING_NETWORK_REQUESTS: IntGauge = OP_COUNTERS.gauge("pending_network_requests");
+/// Counter of pending network events to Discovery.
+pub static PENDING_DISCOVERY_NETWORK_EVENTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "libra_network_pending_discovery_events",
+        "Number of pending discovery events by state",
+        &["state"]
+    )
+    .unwrap()
+});
 
-    /// Counter of pending network events to Mempool
-    pub static ref PENDING_MEMPOOL_NETWORK_EVENTS: IntGauge = OP_COUNTERS.gauge("pending_mempool_network_events");
+/// Counter of pending requests in Peer Manager
+pub static PENDING_PEER_MANAGER_REQUESTS: Lazy<IntCounterVec> = Lazy::new(|| {
+    register_int_counter_vec!(
+        "libra_network_pending_peer_manager_requests",
+        "Number of pending peer manager requests by state",
+        &["state"]
+    )
+    .unwrap()
+});
 
-    /// Counter of pending network events to Consensus
-    pub static ref PENDING_CONSENSUS_NETWORK_EVENTS: IntGauge = OP_COUNTERS.gauge("pending_consensus_network_events");
+///
+/// Channel Counters
+///
 
-    /// Counter of pending network events to State Synchronizer
-    pub static ref PENDING_STATE_SYNCHRONIZER_NETWORK_EVENTS: IntGauge = OP_COUNTERS.gauge("pending_state_sync_network_events");
+/// Counter of pending requests in Connectivity Manager
+pub static PENDING_CONNECTIVITY_MANAGER_REQUESTS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "libra_network_pending_connectivity_manager_requests",
+        "Number of pending connectivity manager requests"
+    )
+    .unwrap()
+});
 
-    /// Counter of pending network events to Admission Control
-    pub static ref PENDING_ADMISSION_CONTROL_NETWORK_EVENTS: IntGauge = OP_COUNTERS.gauge("pending_admission_control_network_events");
+/// Counter of pending Connection Handler notifications to PeerManager.
+pub static PENDING_CONNECTION_HANDLER_NOTIFICATIONS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "libra_network_pending_connection_handler_notifications",
+        "Number of pending connection handler notifications"
+    )
+    .unwrap()
+});
 
-    /// Counter of pending network events to Health Checker.
-    pub static ref PENDING_HEALTH_CHECKER_NETWORK_EVENTS: IntGauge = OP_COUNTERS.gauge("pending_health_checker_network_events");
+/// Counter of pending dial requests in Peer Manager
+pub static PENDING_PEER_MANAGER_DIAL_REQUESTS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "libra_network_pending_peer_manager_dial_requests",
+        "Number of pending peer manager dial requests"
+    )
+    .unwrap()
+});
 
-    /// Counter of pending network events to Discovery.
-    pub static ref PENDING_DISCOVERY_NETWORK_EVENTS: IntGauge = OP_COUNTERS.gauge("pending_discovery_network_events");
+/// Counter of messages pending in queue to be sent out on the wire.
+pub static PENDING_WIRE_MESSAGES: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "libra_network_pending_wire_messages",
+        "Number of pending wire messages"
+    )
+    .unwrap()
+});
 
-    /// Counter of pending requests in Peer Manager
-    pub static ref PENDING_PEER_MANAGER_REQUESTS: IntGauge = OP_COUNTERS.gauge("pending_peer_manager_requests");
+/// Counter of pending requests in Direct Send
+pub static PENDING_DIRECT_SEND_REQUESTS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "libra_network_pending_direct_send_requests",
+        "Number of pending direct send requests"
+    )
+    .unwrap()
+});
 
-    /// Counter of pending Peer Manager notifications in Network Provider
-    pub static ref PENDING_PEER_MANAGER_NET_NOTIFICATIONS: IntGauge = OP_COUNTERS.gauge("pending_peer_manager_net_notifications");
+/// Counter of pending Direct Send notifications to Network Provider
+pub static PENDING_DIRECT_SEND_NOTIFICATIONS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "libra_network_pending_direct_send_notifications",
+        "Number of pending direct send notifications"
+    )
+    .unwrap()
+});
 
-    /// Counter of pending requests in Direct Send
-    pub static ref PENDING_DIRECT_SEND_REQUESTS: IntGauge = OP_COUNTERS.gauge("pending_direct_send_requests");
+/// Counter of pending requests in RPC
+pub static PENDING_RPC_REQUESTS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "libra_network_pending_rpc_requests",
+        "Number of pending rpc requests"
+    )
+    .unwrap()
+});
 
-    /// Counter of pending Direct Send notifications to Network Provider
-    pub static ref PENDING_DIRECT_SEND_NOTIFICATIONS: IntGauge = OP_COUNTERS.gauge("pending_direct_send_notifications");
+/// Counter of pending RPC notifications to Network Provider
+pub static PENDING_RPC_NOTIFICATIONS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "libra_network_pending_rpc_notifications",
+        "Number of pending rpc notifications"
+    )
+    .unwrap()
+});
 
-    /// Counter of pending requests in Connectivity Manager
-    pub static ref PENDING_CONNECTIVITY_MANAGER_REQUESTS: IntGauge = OP_COUNTERS.gauge("pending_connectivity_manager_requests");
+/// Counter of pending requests for each remote peer
+pub static PENDING_PEER_REQUESTS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "libra_network_pending_peer_requests",
+        "Number of pending peer requests"
+    )
+    .unwrap()
+});
 
-    /// Counter of pending requests in RPC
-    pub static ref PENDING_RPC_REQUESTS: IntGauge = OP_COUNTERS.gauge("pending_rpc_requests");
+/// Counter of pending RPC events from Peer to Rpc actor.
+pub static PENDING_PEER_RPC_NOTIFICATIONS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "libra_network_pending_peer_rpc_notifications",
+        "Number of pending peer rpc notifications"
+    )
+    .unwrap()
+});
 
-    /// Counter of pending RPC notifications to Network Provider
-    pub static ref PENDING_RPC_NOTIFICATIONS: IntGauge = OP_COUNTERS.gauge("pending_rpc_notifications");
+/// Counter of pending DirectSend events from Peer to DirectSend actor..
+pub static PENDING_PEER_DIRECT_SEND_NOTIFICATIONS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "libra_network_pending_peer_direct_send_notifications",
+        "Number of pending peer direct send notifications"
+    )
+    .unwrap()
+});
 
-    /// Counter of pending Peer Manager notifications to Direct Send
-    pub static ref PENDING_PEER_MANAGER_DIRECT_SEND_NOTIFICATIONS: IntGauge = OP_COUNTERS.gauge("pending_peer_manager_direct_send_notifications");
-
-    /// Counter of pending Peer Manager notifications to RPC
-    pub static ref PENDING_PEER_MANAGER_RPC_NOTIFICATIONS: IntGauge = OP_COUNTERS.gauge("pending_peer_manager_rpc_notifications");
-
-    /// Counter of pending Peer Manager notifications to Discovery
-    pub static ref PENDING_PEER_MANAGER_DISCOVERY_NOTIFICATIONS: IntGauge = OP_COUNTERS.gauge("pending_peer_manager_discovery_notifications");
-
-    /// Counter of pending Peer Manager notifications to Ping
-    pub static ref PENDING_PEER_MANAGER_PING_NOTIFICATIONS: IntGauge = OP_COUNTERS.gauge("pending_peer_manager_ping_notifications");
-
-    /// Counter of pending Peer Manager notifications to Connectivity Manager
-    pub static ref PENDING_PEER_MANAGER_CONNECTIVITY_MANAGER_NOTIFICATIONS: IntGauge = OP_COUNTERS.gauge("pending_peer_manager_connectivity_manager_notifications");
-
-    /// Counter of pending internal events in Peer Manager
-    pub static ref PENDING_PEER_MANAGER_INTERNAL_EVENTS: IntGauge = OP_COUNTERS.gauge("pending_peer_manager_internal_events");
-
-    /// Counter of pending dial requests in Peer Manager
-    pub static ref PENDING_PEER_MANAGER_DIAL_REQUESTS: IntGauge  = OP_COUNTERS.gauge("pending_peer_manager_dial_requests");
-
-    /// Counter of pending requests for each remote peer
-    pub static ref PENDING_PEER_REQUESTS: &'static str = "pending_peer_requests";
-
-    /// Counter of pending outbound messages in Direct Send for each remote peer
-    pub static ref PENDING_DIRECT_SEND_OUTBOUND_MESSAGES: &'static str = "pending_direct_send_outbound_messages";
-}
+/// Counter of pending connection notifications from Peer to NetworkProvider.
+pub static PENDING_PEER_NETWORK_NOTIFICATIONS: Lazy<IntGauge> = Lazy::new(|| {
+    register_int_gauge!(
+        "libra_network_pending_peer_network_notifications",
+        "Number of pending peer network notifications"
+    )
+    .unwrap()
+});

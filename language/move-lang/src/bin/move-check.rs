@@ -1,8 +1,12 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use move_lang::command_line::{self as cli};
-use move_lang::shared::*;
+#![forbid(unsafe_code)]
+
+use move_lang::{
+    command_line::{self as cli},
+    shared::*,
+};
 use structopt::*;
 
 #[derive(Debug, StructOpt)]
@@ -12,22 +16,16 @@ use structopt::*;
 )]
 pub struct Options {
     /// The source files to check
-    #[structopt(
-        name = "PATH_TO_SOURCE_FILE",
-        short = cli::SOURCE_FILES_SHORT,
-        long = cli::SOURCE_FILES,
-        parse(from_str = cli::leak_str)
-    )]
-    pub source_files: Vec<&'static str>,
+    #[structopt(name = "PATH_TO_SOURCE_FILE")]
+    pub source_files: Vec<String>,
 
     /// The library files needed as dependencies
     #[structopt(
         name = "PATH_TO_DEPENDENCY_FILE",
-        short = cli::DEPENDENCIES_SHORT,
-        long = cli::DEPENDENCIES,
-        parse(from_str = cli::leak_str)
+        short = cli::DEPENDENCY_SHORT,
+        long = cli::DEPENDENCY,
     )]
-    pub dependencies: Vec<&'static str>,
+    pub dependencies: Vec<String>,
 
     /// The sender address for modules and scripts
     #[structopt(
@@ -37,13 +35,24 @@ pub struct Options {
         parse(try_from_str = cli::parse_address)
     )]
     pub sender: Option<Address>,
+
+    /// The output directory for saved artifacts, namely any 'move' interface files generated from
+    /// 'mv' files
+    #[structopt(
+        name = "PATH_TO_OUTPUT_DIRECTORY",
+        short = cli::OUT_DIR_SHORT,
+        long = cli::OUT_DIR,
+    )]
+    pub out_dir: Option<String>,
 }
 
-pub fn main() -> std::io::Result<()> {
+pub fn main() -> anyhow::Result<()> {
     let Options {
         source_files,
         dependencies,
         sender,
+        out_dir,
     } = Options::from_args();
-    move_lang::move_check(&source_files, &dependencies, sender)
+
+    move_lang::move_check(&source_files, &dependencies, sender, out_dir)
 }

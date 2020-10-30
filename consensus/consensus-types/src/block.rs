@@ -3,28 +3,20 @@
 
 use crate::{
     block_data::{BlockData, BlockType},
-    common::{Author, Round},
+    common::{Author, Payload, Round},
     quorum_cert::QuorumCert,
-    vote_data::VoteData,
 };
-use failure::{bail, ensure, format_err};
-use libra_crypto::hash::{CryptoHash, HashValue};
-use libra_types::account_address::{AccountAddress, ADDRESS_LENGTH};
-use libra_types::block_info::BlockInfo;
-use libra_types::block_metadata::BlockMetadata;
-use libra_types::transaction::Version;
-use libra_types::validator_set::ValidatorSet;
+use anyhow::{bail, ensure, format_err};
+use libra_crypto::{ed25519::Ed25519Signature, hash::CryptoHash, HashValue};
+use libra_infallible::duration_since_epoch;
 use libra_types::{
-    crypto_proxies::{LedgerInfoWithSignatures, Signature, ValidatorSigner, ValidatorVerifier},
-    ledger_info::LedgerInfo,
+    account_address::AccountAddress, block_info::BlockInfo, block_metadata::BlockMetadata,
+    epoch_state::EpochState, ledger_info::LedgerInfo, transaction::Version,
+    validator_signer::ValidatorSigner, validator_verifier::ValidatorVerifier,
 };
 use mirai_annotations::debug_checked_verify_eq;
-use serde::{de::DeserializeOwned, Deserialize, Deserializer, Serialize};
-use std::{
-    collections::BTreeMap,
-    convert::TryFrom,
-    fmt::{Display, Formatter},
-};
+use serde::{Deserialize, Deserializer, Serialize};
+use std::fmt::{self, Display, Formatter};
 
 #[path = "block_test_utils.rs"]
 #[cfg(any(test, feature = "fuzzing"))]
@@ -34,21 +26,27 @@ pub mod block_test_utils;
 #[path = "block_test.rs"]
 pub mod block_test;
 
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Clone, PartialEq, Eq)]
 /// Block has the core data of a consensus block that should be persistent when necessary.
 /// Each block must know the id of its parent and keep the QuorurmCertificate to that parent.
-pub struct Block<T> {
+pub struct Block {
     /// This block's id as a hash value, it is generated at call time
     #[serde(skip)]
     id: HashValue,
     /// The container for the actual block
-    block_data: BlockData<T>,
+    block_data: BlockData,
     /// Signature that the hash of this block has been authored by the owner of the private key,
     /// this is only set within Proposal blocks
-    signature: Option<Signature>,
+    signature: Option<Ed25519Signature>,
 }
 
-impl<T: PartialEq> Display for Block<T> {
+impl fmt::Debug for Block {
+    fn fmt(&self, f: &mut Formatter) -> fmt::Result {
+        write!(f, "{}", self)
+    }
+}
+
+impl Display for Block {
     fn fmt(&self, f: &mut Formatter) -> std::fmt::Result {
         let nil_marker = if self.is_nil_block() { " (NIL)" } else { "" };
         write!(
@@ -63,7 +61,7 @@ impl<T: PartialEq> Display for Block<T> {
     }
 }
 
-impl<T> Block<T> {
+impl Block {
     pub fn author(&self) -> Option<Author> {
         self.block_data.author()
     }
@@ -86,7 +84,7 @@ impl<T> Block<T> {
         self.block_data.quorum_cert().certified_block().id()
     }
 
-    pub fn payload(&self) -> Option<&T> {
+    pub fn payload(&self) -> Option<&Payload> {
         self.block_data.payload()
     }
 
@@ -98,7 +96,7 @@ impl<T> Block<T> {
         self.block_data.round()
     }
 
-    pub fn signature(&self) -> Option<&Signature> {
+    pub fn signature(&self) -> Option<&Ed25519Signature> {
         self.signature.as_ref()
     }
 
@@ -110,7 +108,7 @@ impl<T> Block<T> {
         &self,
         executed_state_id: HashValue,
         version: Version,
-        next_validator_set: Option<ValidatorSet>,
+        next_epoch_state: Option<EpochState>,
     ) -> BlockInfo {
         BlockInfo::new(
             self.epoch(),
@@ -119,15 +117,14 @@ impl<T> Block<T> {
             executed_state_id,
             version,
             self.timestamp_usecs(),
-            next_validator_set,
+            next_epoch_state,
         )
     }
-}
 
-impl<T> Block<T>
-where
-    T: PartialEq,
-{
+    pub fn block_data(&self) -> &BlockData {
+        &self.block_data
+    }
+
     pub fn is_genesis_block(&self) -> bool {
         self.block_data.is_genesis_block()
     }
@@ -135,47 +132,34 @@ where
     pub fn is_nil_block(&self) -> bool {
         self.block_data.is_nil_block()
     }
-}
 
-impl<T> Block<T>
-where
-    T: Default + PartialEq + Serialize,
-{
     #[cfg(any(test, feature = "fuzzing"))]
     pub fn make_genesis_block() -> Self {
-        Self::make_genesis_block_from_ledger_info(&LedgerInfo::genesis())
+        Self::make_genesis_block_from_ledger_info(&LedgerInfo::mock_genesis(None))
     }
 
     /// Construct new genesis block for next epoch deterministically from the end-epoch LedgerInfo
     /// We carry over most fields except round and block id
     pub fn make_genesis_block_from_ledger_info(ledger_info: &LedgerInfo) -> Self {
-        assert!(ledger_info.next_validator_set().is_some());
-        let ancestor = BlockInfo::new(
-            ledger_info.epoch(),
-            0,
-            HashValue::zero(),
-            ledger_info.transaction_accumulator_hash(),
-            ledger_info.version(),
-            ledger_info.timestamp_usecs(),
-            None,
-        );
-
-        // Genesis carries a placeholder quorum certificate to its parent id with LedgerInfo
-        // carrying information about version from the last LedgerInfo of previous epoch.
-        let genesis_quorum_cert = QuorumCert::new(
-            VoteData::new(ancestor.clone(), ancestor.clone()),
-            LedgerInfoWithSignatures::new(
-                LedgerInfo::new(ancestor, HashValue::zero()),
-                BTreeMap::new(),
-            ),
-        );
-
-        let block_data = BlockData::new_genesis(ledger_info.timestamp_usecs(), genesis_quorum_cert);
-
+        let block_data = BlockData::new_genesis_from_ledger_info(ledger_info);
         Block {
             id: block_data.hash(),
             block_data,
             signature: None,
+        }
+    }
+
+    #[cfg(any(test, feature = "fuzzing"))]
+    // This method should only used by tests and fuzzers to produce arbitrary Block types.
+    pub fn new_for_testing(
+        id: HashValue,
+        block_data: BlockData,
+        signature: Option<Ed25519Signature>,
+    ) -> Self {
+        Block {
+            id,
+            block_data,
+            signature,
         }
     }
 
@@ -192,7 +176,7 @@ where
     }
 
     pub fn new_proposal(
-        payload: T,
+        payload: Payload,
         round: Round,
         timestamp_usecs: u64,
         quorum_cert: QuorumCert,
@@ -210,24 +194,22 @@ where
     }
 
     pub fn new_proposal_from_block_data(
-        block_data: BlockData<T>,
+        block_data: BlockData,
         validator_signer: &ValidatorSigner,
     ) -> Self {
         let id = block_data.hash();
-        let signature = validator_signer
-            .sign_message(id)
-            .expect("Failed to sign message");
+        let signature = validator_signer.sign(&block_data);
 
         Block {
             id,
             block_data,
-            signature: Some(signature.into()),
+            signature: Some(signature),
         }
     }
 
     /// Verifies that the proposal and the QC are correctly signed.
     /// If this is the genesis block, we skip these checks.
-    pub fn validate_signatures(&self, validator: &ValidatorVerifier) -> failure::Result<()> {
+    pub fn validate_signature(&self, validator: &ValidatorVerifier) -> anyhow::Result<()> {
         match self.block_data.block_type() {
             BlockType::Genesis => bail!("We should not accept genesis from others"),
             BlockType::NilBlock => self.quorum_cert().verify(validator),
@@ -236,7 +218,7 @@ where
                     .signature
                     .as_ref()
                     .ok_or_else(|| format_err!("Missing signature in Proposal"))?;
-                signature.verify(validator, *author, self.id())?;
+                validator.verify(*author, &self.block_data, signature)?;
                 self.quorum_cert().verify(validator)
             }
         }
@@ -244,60 +226,69 @@ where
 
     /// Makes sure that the proposal makes sense, independently of the current state.
     /// If this is the genesis block, we skip these checks.
-    pub fn verify_well_formed(&self) -> failure::Result<()> {
+    pub fn verify_well_formed(&self) -> anyhow::Result<()> {
         ensure!(
             !self.is_genesis_block(),
-            "We should not accept genesis from others"
+            "We must not accept genesis from others"
+        );
+        let parent = self.quorum_cert().certified_block();
+        ensure!(
+            parent.round() < self.round(),
+            "Block must have a greater round than parent's block"
         );
         ensure!(
-            self.quorum_cert().certified_block().round() < self.round(),
-            "Block has invalid round"
+            parent.epoch() == self.epoch(),
+            "block's parent should be in the same epoch"
+        );
+        if parent.has_reconfiguration() {
+            ensure!(
+                self.payload().map_or(true, |p| p.is_empty()),
+                "Reconfiguration suffix should not carry payload"
+            );
+        }
+        if self.is_nil_block() || parent.has_reconfiguration() {
+            ensure!(
+                self.timestamp_usecs() == parent.timestamp_usecs(),
+                "Nil/reconfig suffix block must have same timestamp as parent"
+            );
+        } else {
+            ensure!(
+                self.timestamp_usecs() > parent.timestamp_usecs(),
+                "Blocks must have strictly increasing timestamps"
+            );
+
+            let current_ts = duration_since_epoch();
+
+            // we can say that too far is 5 minutes in the future
+            const TIMEBOUND: u64 = 300_000_000;
+            ensure!(
+                self.timestamp_usecs() <= current_ts.as_micros() as u64 + TIMEBOUND,
+                "Blocks must not be too far in the future"
+            );
+        }
+        ensure!(
+            !self.quorum_cert().ends_epoch(),
+            "Block cannot be proposed in an epoch that has ended"
         );
         debug_checked_verify_eq!(
             self.id(),
             self.block_data.hash(),
             "Block id mismatch the hash"
         );
-
-        ensure!(!self.quorum_cert().ends_epoch(), "Block after epoch ends");
         Ok(())
     }
 }
 
-impl<T> TryFrom<network::proto::Block> for Block<T>
-where
-    T: DeserializeOwned + Serialize,
-{
-    type Error = failure::Error;
-
-    fn try_from(proto: network::proto::Block) -> failure::Result<Self> {
-        Ok(lcs::from_bytes(&proto.bytes)?)
-    }
-}
-
-impl<T> TryFrom<Block<T>> for network::proto::Block
-where
-    T: Serialize + Default + PartialEq,
-{
-    type Error = failure::Error;
-
-    fn try_from(block: Block<T>) -> failure::Result<Self> {
-        Ok(Self {
-            bytes: lcs::to_bytes(&block)?,
-        })
-    }
-}
-
-impl<'de, T: DeserializeOwned + Serialize> Deserialize<'de> for Block<T> {
+impl<'de> Deserialize<'de> for Block {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
     {
         #[derive(Deserialize)]
-        struct BlockWithoutId<T> {
-            #[serde(bound(deserialize = "BlockData<T>: Deserialize<'de>"))]
-            block_data: BlockData<T>,
-            signature: Option<Signature>,
+        #[serde(rename = "Block")]
+        struct BlockWithoutId {
+            block_data: BlockData,
+            signature: Option<Ed25519Signature>,
         };
 
         let BlockWithoutId {
@@ -313,16 +304,22 @@ impl<'de, T: DeserializeOwned + Serialize> Deserialize<'de> for Block<T> {
     }
 }
 
-impl<T> From<&Block<T>> for BlockMetadata {
-    fn from(block: &Block<T>) -> Self {
+impl From<&Block> for BlockMetadata {
+    fn from(block: &Block) -> Self {
         Self::new(
             block.id(),
+            block.round(),
             block.timestamp_usecs(),
-            block.quorum_cert().ledger_info().signatures().clone(),
-            // For nil block, we use 0x0 which is convention for nil address in move.
+            // an ordered vector of voters' account address
             block
-                .author()
-                .unwrap_or_else(|| AccountAddress::new([0u8; ADDRESS_LENGTH])),
+                .quorum_cert()
+                .ledger_info()
+                .signatures()
+                .keys()
+                .cloned()
+                .collect(),
+            // For nil block, we use 0x0 which is convention for nil address in move.
+            block.author().unwrap_or(AccountAddress::ZERO),
         )
     }
 }

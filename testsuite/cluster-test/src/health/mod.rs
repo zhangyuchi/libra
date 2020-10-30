@@ -1,32 +1,43 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 mod commit_check;
 mod debug_interface_log_tail;
+mod fullnode_check;
 mod liveness_check;
 mod log_tail;
 
-use crate::{cluster::Cluster, util::unix_timestamp_now};
+use crate::cluster::Cluster;
+use anyhow::{bail, Result};
+use async_trait::async_trait;
 pub use commit_check::CommitHistoryHealthCheck;
-pub use debug_interface_log_tail::DebugPortLogThread;
-use failure::prelude::*;
+pub use debug_interface_log_tail::DebugPortLogWorker;
+pub use fullnode_check::FullNodeHealthCheck;
 use itertools::Itertools;
 pub use liveness_check::LivenessHealthCheck;
-pub use log_tail::LogTail;
+pub use log_tail::{LogTail, TraceTail};
 use std::{
-    collections::HashMap,
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fmt,
     iter::FromIterator,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 use termion::color::*;
 
 #[derive(Clone, Debug)]
 pub struct Commit {
     commit: String,
+    epoch: u64,
     round: u64,
     parent: String,
+}
+
+impl Commit {
+    pub fn epoch_and_round(&self) -> (u64, u64) {
+        (self.epoch, self.round)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -56,11 +67,12 @@ impl fmt::Debug for ValidatorEvent {
     }
 }
 
-pub trait HealthCheck {
+#[async_trait]
+pub trait HealthCheck: Send {
     /// Verify specific event
-    fn on_event(&mut self, event: &ValidatorEvent, ctx: &mut HealthCheckContext);
+    fn on_event(&mut self, _event: &ValidatorEvent, _ctx: &mut HealthCheckContext) {}
     /// Periodic verification (happens even if when no events produced)
-    fn verify(&mut self, _ctx: &mut HealthCheckContext) {}
+    async fn verify(&mut self, _ctx: &mut HealthCheckContext);
     /// Optionally marks validator as failed, requiring waiting for at least one event from it to
     /// mark it as healthy again
     fn invalidate(&mut self, _validator: &str) {}
@@ -88,11 +100,13 @@ impl HealthCheckRunner {
 
     pub fn new_all(cluster: Cluster) -> Self {
         let liveness_health_check = LivenessHealthCheck::new(&cluster);
+        let fullnode_check = FullNodeHealthCheck::new(cluster.clone());
         Self::new(
             cluster,
             vec![
                 Box::new(CommitHistoryHealthCheck::new()),
                 Box::new(liveness_health_check),
+                Box::new(fullnode_check),
             ],
         )
     }
@@ -102,15 +116,15 @@ impl HealthCheckRunner {
     /// of all the unexpected failures.
     /// Otherwise, it returns a list of ALL the failed validators
     /// It also takes print_failures parameter that controls level of verbosity of health check
-    pub fn run(
+    pub async fn run(
         &mut self,
         events: &[ValidatorEvent],
         affected_validators_set: &HashSet<String>,
         print_failures: PrintFailures,
-    ) -> failure::Result<Vec<String>> {
+    ) -> Result<Vec<String>> {
         let mut node_health = HashMap::new();
-        for instance in self.cluster.instances() {
-            node_health.insert(instance.short_hash().clone(), true);
+        for instance in self.cluster.validator_instances() {
+            node_health.insert(instance.peer_name().clone(), true);
         }
         let mut messages = vec![];
 
@@ -121,12 +135,12 @@ impl HealthCheckRunner {
                 health_check.on_event(event, &mut context);
             }
             let events_processed = Instant::now();
-            health_check.verify(&mut context);
+            health_check.verify(&mut context).await;
             let verified = Instant::now();
             if self.debug {
                 messages.push(format!(
                     "{} {}, on_event time: {}ms, verify time: {}ms, events: {}",
-                    unix_timestamp_now().as_millis(),
+                    libra_infallible::duration_since_epoch().as_millis(),
                     health_check.name(),
                     (events_processed - start).as_millis(),
                     (verified - events_processed).as_millis(),
@@ -136,7 +150,11 @@ impl HealthCheckRunner {
         }
         for err in context.err_acc {
             node_health.insert(err.validator.clone(), false);
-            messages.push(format!("{} {:?}", unix_timestamp_now().as_millis(), err));
+            messages.push(format!(
+                "{} {:?}",
+                libra_infallible::duration_since_epoch().as_millis(),
+                err
+            ));
         }
 
         let mut failed = vec![];
@@ -215,9 +233,7 @@ pub struct HealthCheckError {
 
 impl HealthCheckContext {
     pub fn new() -> Self {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("Now is behind UNIX_EPOCH");
+        let now = libra_infallible::duration_since_epoch();
         Self {
             now,
             err_acc: vec![],
@@ -230,5 +246,11 @@ impl HealthCheckContext {
 
     pub fn report_failure(&mut self, validator: String, message: String) {
         self.err_acc.push(HealthCheckError { validator, message })
+    }
+}
+
+impl Default for HealthCheckContext {
+    fn default() -> Self {
+        Self::new()
     }
 }

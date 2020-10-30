@@ -1,35 +1,49 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::shared::unique_map::UniqueMap;
 use crate::{
     errors::*,
-    expansion::ast::{self as E, Fields},
-    parser::ast::{
-        self as P, Field, FunctionName, FunctionVisibility, Kind, ModuleIdent, ModuleIdent_,
-        ModuleName, StructName, Var,
+    expansion::{
+        aliases::{AliasMap, AliasSet},
+        ast::{self as E, Fields, SpecId},
+        byte_string, hex_string,
     },
-    shared::*,
+    parser::ast::{
+        self as P, ConstantName, Field, FunctionName, FunctionVisibility, Kind, ModuleIdent,
+        ModuleIdent_, ModuleName, StructName, Var,
+    },
+    shared::{unique_map::UniqueMap, *},
 };
-use std::collections::VecDeque;
+use move_ir_types::location::*;
+use std::{
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    iter::IntoIterator,
+};
 
 //**************************************************************************************************
 // Context
 //**************************************************************************************************
 
-type AliasMap = UniqueMap<Name, ModuleIdent>;
-
+type ModuleMembers = BTreeMap<Name, ModuleMemberKind>;
 struct Context {
+    module_members: UniqueMap<ModuleIdent, ModuleMembers>,
     errors: Errors,
     address: Option<Address>,
     aliases: AliasMap,
+    is_source_module: bool,
+    in_spec_context: bool,
+    exp_specs: BTreeMap<SpecId, E::SpecBlock>,
 }
 impl Context {
-    fn new() -> Self {
+    fn new(module_members: UniqueMap<ModuleIdent, ModuleMembers>) -> Self {
         Self {
+            module_members,
             errors: vec![],
             address: None,
-            aliases: UniqueMap::new(),
+            aliases: AliasMap::new(),
+            is_source_module: false,
+            in_spec_context: false,
+            exp_specs: BTreeMap::new(),
         }
     }
 
@@ -50,12 +64,49 @@ impl Context {
         self.address.unwrap()
     }
 
-    pub fn set_aliases(&mut self, alias_map: AliasMap) {
-        self.aliases = alias_map;
+    /// Adds all of the new items in the new inner scope as shadowing the outer one.
+    /// Gives back the outer scope
+    pub fn new_alias_scope(&mut self, inner_scope: AliasMap) -> AliasMap {
+        let outer_scope = self.aliases.clone();
+        self.aliases.add_and_shadow_all(inner_scope);
+        outer_scope
     }
 
-    pub fn module_alias_get(&mut self, n: &Name) -> Option<&ModuleIdent> {
-        self.aliases.get(n)
+    /// Resets the alias map and gives the set of aliases that were used
+    pub fn set_to_outer_scope(&mut self, outer_scope: AliasMap) {
+        let inner_scope = std::mem::replace(&mut self.aliases, outer_scope);
+        let AliasSet { modules, members } = self.aliases.close_scope_and_report_unused(inner_scope);
+        for alias in modules {
+            unused_alias(self, alias)
+        }
+        for alias in members {
+            unused_alias(self, alias)
+        }
+    }
+
+    /// Produces an error if translation is not in specification context.
+    pub fn require_spec_context(&mut self, loc: Loc, item: &str) -> bool {
+        if self.in_spec_context {
+            true
+        } else {
+            self.error(vec![(loc, item)]);
+            false
+        }
+    }
+
+    pub fn bind_exp_spec(&mut self, spec_block: P::SpecBlock) -> (SpecId, BTreeSet<Name>) {
+        let len = self.exp_specs.len();
+        let id = SpecId::new(len);
+        let espec_block = spec(self, spec_block);
+        let mut unbound_names = BTreeSet::new();
+        unbound_names_spec_block(&mut unbound_names, &espec_block);
+        self.exp_specs.insert(id, espec_block);
+
+        (id, unbound_names)
+    }
+
+    pub fn extract_exp_specs(&mut self) -> BTreeMap<SpecId, E::SpecBlock> {
+        std::mem::replace(&mut self.exp_specs, BTreeMap::new())
     }
 }
 
@@ -64,169 +115,203 @@ impl Context {
 //**************************************************************************************************
 
 pub fn program(prog: P::Program, sender: Option<Address>) -> (E::Program, Errors) {
-    let mut context = Context::new();
+    let module_members = {
+        let mut members = UniqueMap::new();
+        all_module_members(&mut members, sender, &prog.lib_definitions);
+        all_module_members(&mut members, sender, &prog.source_definitions);
+        members
+    };
+    let mut context = Context::new(module_members);
     let mut module_map = UniqueMap::new();
-    let mut main_opt = None;
-    // TODO figure out how to use lib definitions
-    // Mark the functions as native?
-    // Ignore any main?
+    let mut scripts = vec![];
+
+    context.is_source_module = false;
     for def in prog.lib_definitions {
         match def {
-            P::FileDefinition::Modules(m_or_a_vec) => {
-                modules_and_addresses(&mut context, sender, false, &mut module_map, m_or_a_vec)
+            P::Definition::Module(m) => module(&mut context, sender, &mut module_map, m),
+            P::Definition::Address(_, addr, ms) => {
+                for m in ms {
+                    module(&mut context, Some(addr), &mut module_map, m)
+                }
             }
-            P::FileDefinition::Main(f) => context.error(vec![(
-                f.function.name.loc(),
-                format!(
-                    "Invalid dependency. '{}' files cannot be depedencies",
-                    FunctionName::MAIN_NAME
-                ),
-            )]),
+            P::Definition::Script(_) => (),
         }
     }
+
+    context.is_source_module = true;
     for def in prog.source_definitions {
         match def {
-            P::FileDefinition::Modules(m_or_a_vec) => {
-                modules_and_addresses(&mut context, sender, true, &mut module_map, m_or_a_vec)
+            P::Definition::Module(m) => module(&mut context, sender, &mut module_map, m),
+            P::Definition::Address(_, addr, ms) => {
+                for m in ms {
+                    module(&mut context, Some(addr), &mut module_map, m)
+                }
             }
-            P::FileDefinition::Main(f) => {
-                context.address = None;
-                let addr = match sender {
-                    Some(addr) => addr,
-                    None => {
-                        let loc = f.function.name.loc();
-                        let msg = format!("Invalid '{}'. No sender address was given as a command line argument. Add one using --{}", FunctionName::MAIN_NAME, crate::command_line::SENDER);
-                        context.error(vec![(loc, msg)]);
-                        Address::LIBRA_CORE
-                    }
-                };
-                main(&mut context, &mut main_opt, addr, f)
-            }
+            P::Definition::Script(s) => script(&mut context, &mut scripts, s),
         }
     }
-    (
-        E::Program {
-            modules: module_map,
-            main: main_opt,
-        },
-        context.get_errors(),
-    )
-}
 
-fn modules_and_addresses(
-    context: &mut Context,
-    sender: Option<Address>,
-    is_source_module: bool,
-    module_map: &mut UniqueMap<ModuleIdent, E::ModuleDefinition>,
-    m_or_a_vec: Vec<P::ModuleOrAddress>,
-) {
-    let mut addr_directive = None;
-    for m_or_a in m_or_a_vec {
-        match m_or_a {
-            P::ModuleOrAddress::Address(loc, a) => addr_directive = Some((loc, a)),
-            P::ModuleOrAddress::Module(module_def) => {
-                let (mident, mod_) = module(
-                    context,
-                    is_source_module,
-                    sender,
-                    addr_directive,
-                    module_def,
-                );
-                if let Err((old_loc, _)) = module_map.add(mident.clone(), mod_) {
-                    context.error(vec![
-                        (
-                            mident.loc(),
-                            format!("Duplicate definition for module '{}'", mident),
-                        ),
-                        (old_loc, "Previously defined here".into()),
-                    ]);
+    let scripts = {
+        let mut collected: BTreeMap<String, Vec<E::Script>> = BTreeMap::new();
+        for s in scripts {
+            collected
+                .entry(s.function_name.value().to_owned())
+                .or_insert_with(Vec::new)
+                .push(s)
+        }
+        let mut keyed: BTreeMap<String, E::Script> = BTreeMap::new();
+        for (n, mut ss) in collected {
+            match ss.len() {
+                0 => unreachable!(),
+                1 => assert!(
+                    keyed.insert(n, ss.pop().unwrap()).is_none(),
+                    "ICE duplicate script key"
+                ),
+                _ => {
+                    for (i, s) in ss.into_iter().enumerate() {
+                        let k = format!("{}_{}", n, i);
+                        assert!(keyed.insert(k, s).is_none(), "ICE duplicate script key")
+                    }
                 }
             }
         }
-    }
-}
-
-fn address_directive(
-    context: &mut Context,
-    sender: Option<Address>,
-    loc: Loc,
-    addr_directive: Option<(Loc, Address)>,
-) {
-    let addr = match (addr_directive, sender) {
-        (Some((_, addr)), _) => addr,
-        (None, Some(addr)) => addr,
-        (None, None) => {
-            context.error(vec![
-                    (loc, format!("Invalid module declration. No sender address was given as a command line argument. Add one using --{}. Or set the address at the top of the file using 'address _:'", crate::command_line::SENDER)),
-                ]);
-            Address::LIBRA_CORE
-        }
+        keyed
     };
-    context.address = Some(addr);
+    let prog = E::Program {
+        modules: module_map,
+        scripts,
+    };
+    (prog, context.get_errors())
 }
 
 fn module(
     context: &mut Context,
-    is_source_module: bool,
-    sender: Option<Address>,
-    addr_directive: Option<(Loc, Address)>,
-    mdef: P::ModuleDefinition,
-) -> (ModuleIdent, E::ModuleDefinition) {
-    let P::ModuleDefinition {
-        mut uses,
-        name,
-        structs: pstructs,
-        functions: pfunctions,
-    } = mdef;
-    let name_loc = name.loc();
-
-    address_directive(context, sender, name_loc, addr_directive);
-
-    let mident_ = ModuleIdent_ {
-        address: context.cur_address(),
-        name: name.clone(),
-    };
-    let current_module = ModuleIdent(sp(name_loc, mident_));
-    let self_name = ModuleName(sp(name_loc, ModuleName::SELF_NAME.into()));
-    uses.insert(0, (current_module.clone(), Some(self_name)));
-    let alias_map = aliases(context, uses);
-    context.set_aliases(alias_map);
-    let structs = structs(context, &name, pstructs);
-    let functions = functions(context, &name, pfunctions);
-    (
-        current_module,
-        E::ModuleDefinition {
-            is_source_module,
-            structs,
-            functions,
-        },
-    )
+    address: Option<Address>,
+    module_map: &mut UniqueMap<ModuleIdent, E::ModuleDefinition>,
+    module_def: P::ModuleDefinition,
+) {
+    assert!(context.address == None);
+    set_sender_address(context, module_def.loc, address);
+    let (mident, mod_) = module_(context, module_def);
+    if let Err((old_loc, _)) = module_map.add(mident.clone(), mod_) {
+        let mmsg = format!("Duplicate definition for module '{}'", mident);
+        context.error(vec![
+            (mident.loc(), mmsg),
+            (old_loc, "Previously defined here".into()),
+        ]);
+    }
+    context.address = None
 }
 
-fn main(
-    context: &mut Context,
-    main_opt: &mut Option<(Address, FunctionName, E::Function)>,
-    addr: Address,
-    main_def: P::Main,
-) {
-    let P::Main {
-        uses,
-        function: pfunction,
-    } = main_def;
-    let alias_map = aliases(context, uses);
-    context.set_aliases(alias_map);
-    let (fname, function) = function_def(context, pfunction);
-    if fname.value() != FunctionName::MAIN_NAME {
-        context.error(vec![
-                    (fname.loc(), format!("Invalid top level function. Found a function named '{}', but all top level functions must be named '{}'", fname.value(),FunctionName::MAIN_NAME))
-                ]);
+fn set_sender_address(context: &mut Context, loc: Loc, sender: Option<Address>) {
+    context.address = Some(match sender {
+        Some(addr) => addr,
+        None => {
+            let msg = format!(
+                "Invalid module declaration. No sender address was given as a command line \
+                 argument. Add one using --{}. Or set the address at the top of the file using \
+                 'address _:'",
+                crate::command_line::SENDER
+            );
+            context.error(vec![(loc, msg)]);
+            Address::LIBRA_CORE
+        }
+    })
+}
+
+fn module_(context: &mut Context, mdef: P::ModuleDefinition) -> (ModuleIdent, E::ModuleDefinition) {
+    let P::ModuleDefinition { loc, name, members } = mdef;
+    let _ = check_restricted_self_name(context, "module", &name.0);
+
+    let name_loc = name.loc();
+    let mident_ = ModuleIdent_ {
+        address: context.cur_address(),
+        name,
+    };
+    let current_module = ModuleIdent(sp(name_loc, mident_));
+
+    let mut new_scope = AliasMap::new();
+    module_self_aliases(&mut new_scope, &current_module);
+    let members = members
+        .into_iter()
+        .filter_map(|member| aliases_from_member(context, &mut new_scope, &current_module, member))
+        .collect::<Vec<_>>();
+    let old_aliases = context.new_alias_scope(new_scope);
+    assert!(
+        old_aliases.is_empty(),
+        "ICE there should be no aliases entering a module"
+    );
+
+    let mut functions = UniqueMap::new();
+    let mut constants = UniqueMap::new();
+    let mut structs = UniqueMap::new();
+    let mut specs = vec![];
+    for member in members {
+        match member {
+            P::ModuleMember::Use(_) => unreachable!(),
+            P::ModuleMember::Function(mut f) => {
+                if !context.is_source_module {
+                    f.body.value = P::FunctionBody_::Native
+                }
+                function(context, &mut functions, f)
+            }
+            P::ModuleMember::Constant(c) => constant(context, &mut constants, c),
+            P::ModuleMember::Struct(mut s) => {
+                if !context.is_source_module {
+                    s.fields = P::StructFields::Native(s.loc)
+                }
+                struct_def(context, &mut structs, s)
+            }
+            P::ModuleMember::Spec(s) => specs.push(spec(context, s)),
+        }
     }
-    match &function.visibility {
-        FunctionVisibility::Internal => (),
-        FunctionVisibility::Public(loc) => context.error(vec![(
-            *loc,
-            "Extraneous 'public' modifier. This top-level function is assumed to be public",
-        )]),
+    context.set_to_outer_scope(old_aliases);
+
+    let def = E::ModuleDefinition {
+        loc,
+        is_source_module: context.is_source_module,
+        structs,
+        constants,
+        functions,
+        specs,
+    };
+    (current_module, def)
+}
+
+fn script(context: &mut Context, scripts: &mut Vec<E::Script>, pscript: P::Script) {
+    scripts.push(script_(context, pscript))
+}
+
+fn script_(context: &mut Context, pscript: P::Script) -> E::Script {
+    assert!(context.address == None);
+    assert!(context.is_source_module);
+    let P::Script {
+        loc,
+        uses,
+        constants: pconstants,
+        function: pfunction,
+        specs: pspecs,
+    } = pscript;
+
+    let mut new_scope = AliasMap::new();
+    for u in uses {
+        use_(context, &mut new_scope, u);
+    }
+    let old_aliases = context.new_alias_scope(new_scope);
+    assert!(
+        old_aliases.is_empty(),
+        "ICE there should be no aliases entering a script"
+    );
+
+    let mut constants = UniqueMap::new();
+    for c in pconstants {
+        constant(context, &mut constants, c);
+    }
+
+    let (function_name, function) = function_(context, pfunction);
+    if let FunctionVisibility::Public(loc) = &function.visibility {
+        let msg = "Extraneous 'public' modifier. Script functions are always public";
+        context.error(vec![(*loc, msg)]);
     }
     match &function.body {
         sp!(_, E::FunctionBody_::Defined(_)) => (),
@@ -235,15 +320,15 @@ fn main(
             "Invalid 'native' function. This top-level function must have a defined body",
         )]),
     }
-    match main_opt {
-        None => *main_opt = Some((addr, fname, function)),
-        Some((_, old_name, _)) => context.error(vec![
-            (
-                fname.loc(),
-                format!("Duplicate definition of '{}'", FunctionName::MAIN_NAME),
-            ),
-            (old_name.loc(), "Previously defined here".into()),
-        ]),
+    let specs = specs(context, pspecs);
+    context.set_to_outer_scope(old_aliases);
+
+    E::Script {
+        loc,
+        constants,
+        function_name,
+        function,
+        specs,
     }
 }
 
@@ -251,69 +336,282 @@ fn main(
 // Aliases
 //**************************************************************************************************
 
-fn aliases(context: &mut Context, uses: Vec<(ModuleIdent, Option<ModuleName>)>) -> AliasMap {
-    let mut alias_map = AliasMap::new();
-    for (mident, alias_opt) in uses {
-        let alias = alias_opt.unwrap_or_else(|| mident.0.value.name.clone());
-        if let Err(old_loc) = alias_map.add(alias.0.clone(), mident) {
-            context.error(vec![
-                (
-                    alias.loc(),
-                    format!("Duplicate definition for alias '{}'", alias),
-                ),
-                (old_loc, "Previously defined here".into()),
-            ])
+fn all_module_members(
+    members: &mut UniqueMap<ModuleIdent, ModuleMembers>,
+    sender: Option<Address>,
+    defs: &[P::Definition],
+) {
+    for def in defs {
+        match def {
+            P::Definition::Module(m) => module_members(members, sender.unwrap_or_default(), m),
+            P::Definition::Address(_, a, ms) => {
+                for m in ms {
+                    module_members(members, *a, m)
+                }
+            }
+            P::Definition::Script(_) => (),
         }
     }
-    alias_map
+}
+
+fn module_members(
+    members: &mut UniqueMap<ModuleIdent, ModuleMembers>,
+    address: Address,
+    m: &P::ModuleDefinition,
+) {
+    let mident_ = ModuleIdent_ {
+        address,
+        name: m.name.clone(),
+    };
+    let mident = ModuleIdent(sp(m.name.loc(), mident_));
+    let mut cur_members = members.remove(&mident).unwrap_or_else(ModuleMembers::new);
+    for mem in &m.members {
+        use P::{SpecBlockMember_ as SBM, SpecBlockTarget_ as SBT, SpecBlock_ as SB};
+        match mem {
+            P::ModuleMember::Function(f) => {
+                cur_members.insert(f.name.0.clone(), ModuleMemberKind::Function);
+            }
+            P::ModuleMember::Constant(c) => {
+                cur_members.insert(c.name.0.clone(), ModuleMemberKind::Constant);
+            }
+            P::ModuleMember::Struct(s) => {
+                cur_members.insert(s.name.0.clone(), ModuleMemberKind::Struct);
+            }
+            P::ModuleMember::Spec(sp!(_, SB { target, members, .. })) => match &target.value {
+                SBT::Schema(n, _) => {
+                    cur_members.insert(n.clone(), ModuleMemberKind::Schema);
+                }
+                SBT::Module => {
+                    for sp!(_, smember_) in members {
+                        if let SBM::Function { name, .. } = smember_ {
+                            cur_members.insert(name.0.clone(), ModuleMemberKind::Function);
+                        }
+                    }
+                }
+                _ => (),
+            },
+            P::ModuleMember::Use(_) => (),
+        };
+    }
+    members.add(mident, cur_members).unwrap();
+}
+
+fn module_self_aliases(acc: &mut AliasMap, current_module: &ModuleIdent) {
+    let self_name = sp(current_module.loc(), ModuleName::SELF_NAME.into());
+    acc.add_implicit_module_alias(self_name, current_module.clone())
+        .unwrap()
+}
+
+fn aliases_from_member(
+    context: &mut Context,
+    acc: &mut AliasMap,
+    current_module: &ModuleIdent,
+    member: P::ModuleMember,
+) -> Option<P::ModuleMember> {
+    use P::{SpecBlockMember_ as SBM, SpecBlockTarget_ as SBT, SpecBlock_ as SB};
+    macro_rules! check_name_and_add_implicit_alias {
+        ($kind:expr, $name:expr) => {{
+            if let Some(n) = check_valid_module_member_name(context, $kind, $name) {
+                if let Err(loc) =
+                    acc.add_implicit_member_alias(n.clone(), current_module.clone(), n.clone())
+                {
+                    duplicate_module_member(context, loc, n)
+                }
+            }
+        }};
+    }
+
+    match member {
+        P::ModuleMember::Use(u) => {
+            use_(context, acc, u);
+            None
+        }
+        P::ModuleMember::Function(f) => {
+            let n = f.name.0.clone();
+            check_name_and_add_implicit_alias!(ModuleMemberKind::Function, n);
+            Some(P::ModuleMember::Function(f))
+        }
+        P::ModuleMember::Constant(c) => {
+            let n = c.name.0.clone();
+            check_name_and_add_implicit_alias!(ModuleMemberKind::Constant, n);
+            Some(P::ModuleMember::Constant(c))
+        }
+        P::ModuleMember::Struct(s) => {
+            let n = s.name.0.clone();
+            check_name_and_add_implicit_alias!(ModuleMemberKind::Struct, n);
+            Some(P::ModuleMember::Struct(s))
+        }
+        P::ModuleMember::Spec(s) => {
+            let sp!(_, SB { target, members, .. }) = &s;
+            match &target.value {
+                SBT::Schema(n, _) => {
+                    check_name_and_add_implicit_alias!(ModuleMemberKind::Schema, n.clone());
+                }
+                SBT::Module => {
+                    for sp!(_, smember_) in members {
+                        if let SBM::Function { name, .. } = smember_ {
+                            let n = name.0.clone();
+                            check_name_and_add_implicit_alias!(ModuleMemberKind::Function, n);
+                        }
+                    }
+                }
+                _ => (),
+            };
+            Some(P::ModuleMember::Spec(s))
+        }
+    }
+}
+
+fn use_(context: &mut Context, acc: &mut AliasMap, u: P::Use) {
+    let unbound_module = |mident: &ModuleIdent| -> Error {
+        vec![(
+            mident.loc(),
+            format!("Invalid 'use'. Unbound module: '{}'", mident),
+        )]
+    };
+    macro_rules! add_module_alias {
+        ($ident:expr, $alias_opt:expr) => {{
+            let alias: Name = $alias_opt.unwrap_or_else(|| $ident.0.value.name.0.clone());
+            if let Err(()) = check_restricted_self_name(context, "module alias", &alias) {
+                return;
+            }
+
+            if let Err(old_loc) = acc.add_module_alias(alias.clone(), $ident) {
+                duplicate_module_alias(context, old_loc, alias)
+            }
+        }};
+    };
+    match u {
+        P::Use::Module(mident, alias_opt) => {
+            if !context.module_members.contains_key(&mident) {
+                context.error(unbound_module(&mident));
+                return;
+            };
+            add_module_alias!(mident, alias_opt.map(|m| m.0))
+        }
+        P::Use::Members(mident, sub_uses) => {
+            let members = match context.module_members.get(&mident) {
+                Some(members) => members,
+                None => {
+                    context.error(unbound_module(&mident));
+                    return;
+                }
+            };
+            let mloc = context.module_members.get_loc(&mident).unwrap().0;
+            let sub_uses_kinds = sub_uses
+                .into_iter()
+                .map(|(member, alia_opt)| {
+                    let kind = members.get(&member).cloned();
+                    (member, alia_opt, kind)
+                })
+                .collect::<Vec<_>>();
+
+            for (member, alias_opt, member_kind_opt) in sub_uses_kinds {
+                if member.value == ModuleName::SELF_NAME {
+                    add_module_alias!(mident.clone(), alias_opt);
+                    continue;
+                }
+
+                // check is member
+
+                let member_kind = match member_kind_opt {
+                    None => {
+                        let msg = format!(
+                            "Invalid 'use'. Unbound member '{}' in module '{}'",
+                            member, mident
+                        );
+                        context.error(vec![
+                            (member.loc, msg),
+                            (mloc, format!("Module '{}' declared here", mident)),
+                        ]);
+                        continue;
+                    }
+                    Some(m) => m,
+                };
+
+                let alias = alias_opt.unwrap_or_else(|| member.clone());
+
+                let alias = match check_valid_module_member_alias(context, member_kind, alias) {
+                    None => continue,
+                    Some(alias) => alias,
+                };
+                if let Err(old_loc) = acc.add_member_alias(alias.clone(), mident.clone(), member) {
+                    duplicate_module_member(context, old_loc, alias)
+                }
+            }
+        }
+    }
+}
+
+fn duplicate_module_alias(context: &mut Context, old_loc: Loc, alias: Name) {
+    let msg = format!(
+        "Duplicate module alias '{}'. Module aliases must be unique within a given namespace",
+        alias
+    );
+    context.error(vec![
+        (alias.loc, msg),
+        (old_loc, "Previously defined here".into()),
+    ])
+}
+
+fn duplicate_module_member(context: &mut Context, old_loc: Loc, alias: Name) {
+    let msg = format!(
+        "Duplicate module member or alias '{}'. Top level names in a namespace must be unique",
+        alias
+    );
+    context.error(vec![
+        (alias.loc, msg),
+        (old_loc, "Previously defined here".into()),
+    ])
+}
+
+fn unused_alias(context: &mut Context, alias: Name) {
+    if !context.is_source_module {
+        return;
+    }
+
+    context.error(vec![(
+        alias.loc,
+        format!("Unused 'use' of alias '{}'. Consider removing it", alias),
+    )])
 }
 
 //**************************************************************************************************
 // Structs
 //**************************************************************************************************
 
-fn structs(
+fn struct_def(
     context: &mut Context,
-    mname: &ModuleName,
-    pstructs: Vec<P::StructDefinition>,
-) -> UniqueMap<StructName, E::StructDefinition> {
-    let mut struct_map = UniqueMap::new();
-
-    for pstruct in pstructs {
-        let (sname, sdef) = struct_def(context, pstruct);
-        if let Err(old_loc) = struct_map.add(sname.clone(), sdef) {
-            context.error(vec![
-                (
-                    sname.loc(),
-                    format!(
-                        "Duplicate definition for struct '{}' in module '{}'",
-                        sname, mname
-                    ),
-                ),
-                (old_loc, "Previously defined here".into()),
-            ]);
-        }
+    structs: &mut UniqueMap<StructName, E::StructDefinition>,
+    pstruct: P::StructDefinition,
+) {
+    let (sname, sdef) = struct_def_(context, pstruct);
+    if let Err(_old_loc) = structs.add(sname, sdef) {
+        assert!(context.has_errors())
     }
-    struct_map
 }
 
-fn struct_def(
+fn struct_def_(
     context: &mut Context,
     pstruct: P::StructDefinition,
 ) -> (StructName, E::StructDefinition) {
     let P::StructDefinition {
+        loc,
         name,
         resource_opt,
         type_parameters: pty_params,
         fields: pfields,
     } = pstruct;
+    let old_aliases = context.new_alias_scope(AliasMap::new());
     let type_parameters = type_parameters(context, pty_params);
     let fields = struct_fields(context, &name, pfields);
     let sdef = E::StructDefinition {
+        loc,
         resource_opt,
         type_parameters,
         fields,
     };
+    context.set_to_outer_scope(old_aliases);
     (name, sdef)
 }
 
@@ -327,9 +625,9 @@ fn struct_fields(
         P::StructFields::Defined(v) => v,
     };
     let mut field_map = UniqueMap::new();
-    for (idx, (field, pst)) in pfields_vec.into_iter().enumerate() {
-        let st = single_type(context, pst);
-        if let Err(old_loc) = field_map.add(field.clone(), (idx, st)) {
+    for (idx, (field, pt)) in pfields_vec.into_iter().enumerate() {
+        let t = type_(context, pt);
+        if let Err(old_loc) = field_map.add(field.clone(), (idx, t)) {
             context.error(vec![
                 (
                     field.loc(),
@@ -346,50 +644,81 @@ fn struct_fields(
 }
 
 //**************************************************************************************************
-// Functiosn
+// Constants
 //**************************************************************************************************
 
-fn functions(
+fn constant(
     context: &mut Context,
-    mname: &ModuleName,
-    pfunctions: Vec<P::Function>,
-) -> UniqueMap<FunctionName, E::Function> {
-    let mut fn_map = UniqueMap::new();
-    for pfunction in pfunctions {
-        let (fname, fdef) = function_def(context, pfunction);
-        if let Err(old_loc) = fn_map.add(fname.clone(), fdef) {
-            context.error(vec![
-                (
-                    fname.loc(),
-                    format!(
-                        "Duplicate definition for function '{}' in module '{}'",
-                        fname, mname
-                    ),
-                ),
-                (old_loc, "Previously defined here".into()),
-            ]);
-        }
+    constants: &mut UniqueMap<ConstantName, E::Constant>,
+    pconstant: P::Constant,
+) {
+    let (name, constant) = constant_(context, pconstant);
+    if let Err(_old_loc) = constants.add(name, constant) {
+        assert!(context.has_errors())
     }
-    fn_map
 }
 
-fn function_def(context: &mut Context, pfunction: P::Function) -> (FunctionName, E::Function) {
+fn constant_(context: &mut Context, pconstant: P::Constant) -> (ConstantName, E::Constant) {
+    assert!(context.exp_specs.is_empty());
+    let P::Constant {
+        loc,
+        name,
+        signature: psignature,
+        value: pvalue,
+    } = pconstant;
+    let signature = type_(context, psignature);
+    let value = exp_(context, pvalue);
+    let _specs = context.extract_exp_specs();
+    let constant = E::Constant {
+        loc,
+        signature,
+        value,
+    };
+    (name, constant)
+}
+
+//**************************************************************************************************
+// Functions
+//**************************************************************************************************
+
+fn function(
+    context: &mut Context,
+    functions: &mut UniqueMap<FunctionName, E::Function>,
+    pfunction: P::Function,
+) {
+    let (fname, fdef) = function_(context, pfunction);
+    if let Err(_old_loc) = functions.add(fname, fdef) {
+        assert!(context.has_errors())
+    }
+}
+
+fn function_(context: &mut Context, pfunction: P::Function) -> (FunctionName, E::Function) {
     let P::Function {
+        loc,
         name,
         visibility,
         signature: psignature,
         body: pbody,
         acquires,
     } = pfunction;
+    assert!(context.exp_specs.is_empty());
+    let old_aliases = context.new_alias_scope(AliasMap::new());
     let signature = function_signature(context, psignature);
-    let acquires = single_types(context, acquires);
+    let acquires = acquires
+        .into_iter()
+        .flat_map(|a| module_access(context, Access::Type, a))
+        .collect();
     let body = function_body(context, pbody);
+    let specs = context.extract_exp_specs();
     let fdef = E::Function {
+        loc,
         visibility,
         signature,
         acquires,
         body,
+        specs,
     };
+    context.set_to_outer_scope(old_aliases);
 
     (name, fdef)
 }
@@ -406,8 +735,11 @@ fn function_signature(
     let type_parameters = type_parameters(context, pty_params);
     let parameters = pparams
         .into_iter()
-        .map(|(v, st)| (v, single_type(context, st)))
-        .collect();
+        .map(|(v, t)| (v, type_(context, t)))
+        .collect::<Vec<_>>();
+    for (v, _) in &parameters {
+        check_valid_local_name(context, v)
+    }
     let return_type = type_(context, pret_ty);
     E::FunctionSignature {
         type_parameters,
@@ -427,11 +759,167 @@ fn function_body(context: &mut Context, sp!(loc, pbody_): P::FunctionBody) -> E:
 }
 
 //**************************************************************************************************
+// Specification Blocks
+//**************************************************************************************************
+
+fn specs(context: &mut Context, pspecs: Vec<P::SpecBlock>) -> Vec<E::SpecBlock> {
+    pspecs.into_iter().map(|s| spec(context, s)).collect()
+}
+
+fn spec(context: &mut Context, sp!(loc, pspec): P::SpecBlock) -> E::SpecBlock {
+    let P::SpecBlock_ {
+        target,
+        uses,
+        members: pmembers,
+    } = pspec;
+
+    context.in_spec_context = true;
+    let mut new_scope = AliasMap::new();
+    for u in uses {
+        use_(context, &mut new_scope, u);
+    }
+    let old_aliases = context.new_alias_scope(new_scope);
+
+    let members = pmembers
+        .into_iter()
+        .filter_map(|m| {
+            let m = spec_member(context, m);
+            if m.is_none() {
+                assert!(context.has_errors())
+            };
+            m
+        })
+        .collect();
+
+    context.set_to_outer_scope(old_aliases);
+    context.in_spec_context = false;
+
+    sp(loc, E::SpecBlock_ { target, members })
+}
+
+fn spec_member(
+    context: &mut Context,
+    sp!(loc, pm): P::SpecBlockMember,
+) -> Option<E::SpecBlockMember> {
+    use E::SpecBlockMember_ as EM;
+    use P::SpecBlockMember_ as PM;
+    let em = match pm {
+        PM::Condition {
+            kind,
+            properties: pproperties,
+            exp,
+            additional_exps,
+        } => {
+            let properties = pproperties
+                .into_iter()
+                .map(|p| pragma_property(context, p))
+                .collect();
+            let exp = exp_(context, exp);
+            let additional_exps = additional_exps
+                .into_iter()
+                .map(|e| exp_(context, e))
+                .collect();
+            EM::Condition {
+                kind,
+                properties,
+                exp,
+                additional_exps,
+            }
+        }
+        PM::Function {
+            name,
+            uninterpreted,
+            signature,
+            body,
+        } => {
+            let old_aliases = context.new_alias_scope(AliasMap::new());
+            let body = function_body(context, body);
+            let signature = function_signature(context, signature);
+            context.set_to_outer_scope(old_aliases);
+            EM::Function {
+                uninterpreted,
+                name,
+                signature,
+                body,
+            }
+        }
+        PM::Variable {
+            is_global,
+            name,
+            type_parameters: pty_params,
+            type_: t,
+        } => {
+            let old_aliases = context.new_alias_scope(AliasMap::new());
+            let type_parameters = type_parameters(context, pty_params);
+            let t = type_(context, t);
+            context.set_to_outer_scope(old_aliases);
+            EM::Variable {
+                is_global,
+                name,
+                type_parameters,
+                type_: t,
+            }
+        }
+        PM::Let { name, def: pdef } => {
+            let def = exp_(context, pdef);
+            EM::Let { name, def }
+        }
+        PM::Include {
+            properties: pproperties,
+            exp: pexp,
+        } => {
+            let properties = pproperties
+                .into_iter()
+                .map(|p| pragma_property(context, p))
+                .collect();
+            EM::Include {
+                properties,
+                exp: exp_(context, pexp),
+            }
+        }
+        PM::Apply {
+            exp: pexp,
+            patterns,
+            exclusion_patterns,
+        } => EM::Apply {
+            exp: exp_(context, pexp),
+            patterns,
+            exclusion_patterns,
+        },
+        PM::Pragma {
+            properties: pproperties,
+        } => {
+            let properties = pproperties
+                .into_iter()
+                .map(|p| pragma_property(context, p))
+                .collect();
+            EM::Pragma { properties }
+        }
+    };
+    Some(sp(loc, em))
+}
+
+fn pragma_property(context: &mut Context, sp!(loc, pp_): P::PragmaProperty) -> E::PragmaProperty {
+    let P::PragmaProperty_ {
+        name,
+        value: pv_opt,
+    } = pp_;
+    let value = pv_opt.and_then(|pv| value(context, pv));
+    sp(loc, E::PragmaProperty_ { name, value })
+}
+
+//**************************************************************************************************
 // Types
 //**************************************************************************************************
 
-fn type_parameters(_context: &mut Context, pty_params: Vec<(Name, Kind)>) -> Vec<(Name, Kind)> {
-    // TODO aliasing will need to happen here at some point
+fn type_parameters(context: &mut Context, pty_params: Vec<(Name, Kind)>) -> Vec<(Name, Kind)> {
+    assert!(
+        context.aliases.current_scope_is_empty(),
+        "ICE alias scope should be cleared before handling type parameters"
+    );
+    for (name, _) in &pty_params {
+        context.aliases.remove_member_alias(name)
+    }
     pty_params
 }
 
@@ -440,70 +928,84 @@ fn type_(context: &mut Context, sp!(loc, pt_): P::Type) -> E::Type {
     use P::Type_ as PT;
     let t_ = match pt_ {
         PT::Unit => ET::Unit,
-        PT::Single(st) => ET::Single(single_type(context, st)),
-        PT::Multiple(ss) => ET::Multiple(single_types(context, ss)),
+        PT::Multiple(ts) => ET::Multiple(types(context, ts)),
+        PT::Apply(pn, ptyargs) => {
+            let tyargs = types(context, ptyargs);
+            match module_access(context, Access::Type, *pn) {
+                None => {
+                    assert!(context.has_errors());
+                    ET::UnresolvedError
+                }
+                Some(n) => ET::Apply(n, tyargs),
+            }
+        }
+        PT::Ref(mut_, inner) => ET::Ref(mut_, Box::new(type_(context, *inner))),
+        PT::Fun(args, result) => {
+            if context
+                .require_spec_context(loc, "`|_|_` function type only allowed in specifications")
+            {
+                let args = types(context, args);
+                let result = type_(context, *result);
+                ET::Fun(args, Box::new(result))
+            } else {
+                assert!(context.has_errors());
+                ET::UnresolvedError
+            }
+        }
     };
     sp(loc, t_)
 }
 
-fn single_types(context: &mut Context, pss: Vec<P::SingleType>) -> Vec<E::SingleType> {
-    pss.into_iter()
-        .map(|pst| single_type(context, pst))
-        .collect()
+fn types(context: &mut Context, pts: Vec<P::Type>) -> Vec<E::Type> {
+    pts.into_iter().map(|pt| type_(context, pt)).collect()
 }
 
-fn single_type(context: &mut Context, pst: P::SingleType) -> E::SingleType {
-    let loc = pst.loc;
-    match single_type_(context, pst) {
-        Some(st) => st,
-        None => {
-            assert!(context.has_errors());
-            sp(loc, E::SingleType_::UnresolvedError)
-        }
-    }
+fn optional_types(context: &mut Context, pts_opt: Option<Vec<P::Type>>) -> Option<Vec<E::Type>> {
+    pts_opt.map(|pts| pts.into_iter().map(|pt| type_(context, pt)).collect())
 }
 
-fn single_type_(context: &mut Context, sp!(loc, pst_): P::SingleType) -> Option<E::SingleType> {
-    use E::SingleType_ as ES;
-    use P::SingleType_ as PS;
-    let st_ = match pst_ {
-        PS::Apply(pn, ptyargs) => {
-            let n = type_name(context, pn)?;
-            let tyargs = single_types(context, ptyargs);
-            ES::Apply(n, tyargs)
-        }
-        PS::Ref(mut_, inner) => ES::Ref(mut_, Box::new(single_type(context, *inner))),
-    };
-    Some(sp(loc, st_))
+#[derive(Clone, Copy)]
+enum Access {
+    Type,
+    ApplyNamed,
+    ApplyPositional,
+    Term,
 }
 
-fn type_name(context: &mut Context, sp!(loc, ptn_): P::TypeName) -> Option<E::TypeName> {
-    use E::TypeName_ as EN;
-    use P::TypeName_ as PN;
-    let tn_ = match ptn_ {
-        PN::Name(n) => {
-            match context.module_alias_get(&n) {
-                Some(_) => {
-                    context.error(vec![
-                        (n.loc, format!("Unexpected module alias '{}'", n)),
-                        (loc, "Modules are not types. Try accessing a struct inside the module instead".into())
-                    ]);
-                    return None;
-                }
+fn module_access(
+    context: &mut Context,
+    access: Access,
+    sp!(loc, ptn_): P::ModuleAccess,
+) -> Option<E::ModuleAccess> {
+    use E::ModuleAccess_ as EN;
+    use P::ModuleAccess_ as PN;
+    let tn_ = match (access, ptn_) {
+        (Access::ApplyPositional, PN::Name(n))
+        | (Access::ApplyNamed, PN::Name(n))
+        | (Access::Type, PN::Name(n)) => match context.aliases.member_alias_get(&n) {
+            Some((mident, mem)) => EN::ModuleAccess(mident.clone(), mem.clone()),
+            None => EN::Name(n),
+        },
+        (Access::Term, PN::Name(n)) if is_valid_struct_constant_or_schema_name(&n.value) => {
+            match context.aliases.member_alias_get(&n) {
+                Some((mident, mem)) => EN::ModuleAccess(mident.clone(), mem.clone()),
                 None => EN::Name(n),
             }
         }
-        PN::ModuleType(mname, sn) => match context.module_alias_get(&mname.0).cloned() {
-            None => {
-                context.error(vec![(
-                    mname.loc(),
-                    format!("Unbound module alias '{}'", mname),
-                )]);
-                return None;
+        (Access::Term, PN::Name(n)) => EN::Name(n),
+        (_, PN::ModuleAccess(mname, n)) => {
+            match context.aliases.module_alias_get(&mname.0).cloned() {
+                None => {
+                    context.error(vec![(
+                        mname.loc(),
+                        format!("Unbound module alias '{}'", mname),
+                    )]);
+                    return None;
+                }
+                Some(mident) => EN::ModuleAccess(mident, n),
             }
-            Some(mident) => EN::ModuleType(mident, sn),
-        },
-        PN::QualifiedModuleType(mident, sn) => EN::ModuleType(mident, sn),
+        }
+        (_, PN::QualifiedModuleAccess(mident, n)) => EN::ModuleAccess(mident, n),
     };
     Some(sp(loc, tn_))
 }
@@ -515,18 +1017,31 @@ fn type_name(context: &mut Context, sp!(loc, ptn_): P::TypeName) -> Option<E::Ty
 // TODO Support uses inside functions. AliasMap will become an accumulator
 
 fn sequence(context: &mut Context, loc: Loc, seq: P::Sequence) -> E::Sequence {
-    let (pitems, pfinal_item) = seq;
+    let (uses, pitems, maybe_last_semicolon_loc, pfinal_item) = seq;
+
+    let mut new_scope = AliasMap::new();
+    for u in uses {
+        use_(context, &mut new_scope, u);
+    }
+    let old_aliases = context.new_alias_scope(new_scope);
     let mut items: VecDeque<E::SequenceItem> = pitems
         .into_iter()
         .map(|item| sequence_item(context, item))
         .collect();
     let final_e_opt = pfinal_item.map(|item| exp_(context, item));
     let final_e = match final_e_opt {
-        None => sp(loc, E::Exp_::Unit),
+        None => {
+            let last_semicolon_loc = match maybe_last_semicolon_loc {
+                Some(l) => l,
+                None => loc,
+            };
+            sp(last_semicolon_loc, E::Exp_::Unit { trailing: true })
+        }
         Some(e) => e,
     };
     let final_item = sp(final_e.loc, E::SequenceItem_::Seq(final_e));
     items.push_back(final_item);
+    context.set_to_outer_scope(old_aliases);
     items
 }
 
@@ -539,7 +1054,10 @@ fn sequence_item(context: &mut Context, sp!(loc, pitem_): P::SequenceItem) -> E:
             let b_opt = bind_list(context, pb);
             let ty_opt = pty_opt.map(|t| type_(context, t));
             match b_opt {
-                None => ES::Seq(sp(loc, E::Exp_::UnresolvedError)),
+                None => {
+                    assert!(context.has_errors());
+                    ES::Seq(sp(loc, E::Exp_::UnresolvedError))
+                }
                 Some(b) => ES::Declare(b, ty_opt),
             }
         }
@@ -552,12 +1070,19 @@ fn sequence_item(context: &mut Context, sp!(loc, pitem_): P::SequenceItem) -> E:
                 Some(ty) => sp(e_.loc, E::Exp_::Annotate(Box::new(e_), ty)),
             };
             match b_opt {
-                None => ES::Seq(sp(loc, E::Exp_::UnresolvedError)),
+                None => {
+                    assert!(context.has_errors());
+                    ES::Seq(sp(loc, E::Exp_::UnresolvedError))
+                }
                 Some(b) => ES::Bind(b, e),
             }
         }
     };
     sp(loc, item_)
+}
+
+fn exps(context: &mut Context, pes: Vec<P::Exp>) -> Vec<E::Exp> {
+    pes.into_iter().map(|pe| exp_(context, pe)).collect()
 }
 
 fn exp(context: &mut Context, pe: P::Exp) -> Box<E::Exp> {
@@ -568,56 +1093,71 @@ fn exp_(context: &mut Context, sp!(loc, pe_): P::Exp) -> E::Exp {
     use E::Exp_ as EE;
     use P::Exp_ as PE;
     let e_ = match pe_ {
-        PE::Unit => EE::Unit,
-        PE::Value(v) => EE::Value(v),
+        PE::Unit => EE::Unit { trailing: false },
+        PE::Value(pv) => match value(context, pv) {
+            Some(v) => EE::Value(v),
+            None => {
+                assert!(context.has_errors());
+                EE::UnresolvedError
+            }
+        },
+        PE::InferredNum(u) => EE::InferredNum(u),
         PE::Move(v) => EE::Move(v),
         PE::Copy(v) => EE::Copy(v),
-        PE::Name(n) => EE::Name(n),
-        PE::MName(n) => match context.module_alias_get(&n) {
-            Some(n) => EE::ModuleIdent(n.clone()),
-            None => EE::MName(n),
-        },
-        PE::MNameTypeArgs(n, _) | PE::NameTypeArgs(n, _) => {
-            context.error(vec![(
+        PE::Name(_, Some(_))
+            if !context.require_spec_context(
                 loc,
-                format!("Unexpected name with type arguments '{}'", &n),
-            )]);
+                "Expected name to be followed by a brace-enclosed list of field expressions or a \
+                 parenthesized list of arguments for a function call",
+            ) =>
+        {
+            assert!(context.has_errors());
             EE::UnresolvedError
         }
-        PE::GlobalApply(plhs, parg) => match call_or_pack(context, *plhs, *parg) {
-            None => {
-                assert!(context.has_errors());
-                EE::UnresolvedError
+        PE::Name(pn, ptys_opt) => {
+            let en_opt = module_access(context, Access::Term, pn);
+            let tys_opt = optional_types(context, ptys_opt);
+            match en_opt {
+                Some(en) => EE::Name(en, tys_opt),
+                None => {
+                    assert!(context.has_errors());
+                    EE::UnresolvedError
+                }
             }
-            Some(EE::Pack(_, _, _)) => {
-                context.error(vec![(
-                    loc,
-                    "Unexpected construction. Found a global-identifier access, and thus expected a function call",
-                )]);
-                EE::UnresolvedError
+        }
+        PE::Call(pn, ptys_opt, sp!(rloc, prs)) => {
+            let tys_opt = optional_types(context, ptys_opt);
+            let ers = sp(rloc, exps(context, prs));
+            let en_opt = module_access(context, Access::ApplyPositional, pn);
+            match en_opt {
+                Some(en) => EE::Call(en, tys_opt, ers),
+                None => {
+                    assert!(context.has_errors());
+                    EE::UnresolvedError
+                }
             }
-            Some(EE::Call(e1, tys, e2)) => EE::GlobalCall(e1, tys, e2),
-            Some(_) => panic!("ICE expected call or pack from call_or_pack"),
-        },
-        PE::Apply(plhs, parg) => match call_or_pack(context, *plhs, *parg) {
-            None => {
-                assert!(context.has_errors());
-                EE::UnresolvedError
+        }
+        PE::Pack(pn, ptys_opt, pfields) => {
+            let en_opt = module_access(context, Access::ApplyNamed, pn);
+            let tys_opt = optional_types(context, ptys_opt);
+            let efields_vec = pfields
+                .into_iter()
+                .map(|(f, pe)| (f, exp_(context, pe)))
+                .collect();
+            let efields = fields(context, loc, "construction", "argument", efields_vec);
+            match en_opt {
+                Some(en) => EE::Pack(en, tys_opt, efields),
+                None => {
+                    assert!(context.has_errors());
+                    EE::UnresolvedError
+                }
             }
-            Some(e_) => e_,
-        },
-        PE::Fields(_) => {
-            context.error(vec![(
-                loc,
-                "Unexpected field arguments. Fields are used only to instantiate a struct",
-            )]);
-            EE::UnresolvedError
         }
         PE::IfElse(pb, pt, pf_opt) => {
             let eb = exp(context, *pb);
             let et = exp(context, *pt);
             let ef = match pf_opt {
-                None => Box::new(sp(loc, EE::Unit)),
+                None => Box::new(sp(loc, EE::Unit { trailing: false })),
                 Some(pf) => exp(context, *pf),
             };
             EE::IfElse(eb, et, ef)
@@ -625,9 +1165,25 @@ fn exp_(context: &mut Context, sp!(loc, pe_): P::Exp) -> E::Exp {
         PE::While(pb, ploop) => EE::While(exp(context, *pb), exp(context, *ploop)),
         PE::Loop(ploop) => EE::Loop(exp(context, *ploop)),
         PE::Block(seq) => EE::Block(sequence(context, loc, seq)),
+        PE::Lambda(pbs, pe) => {
+            if !context.require_spec_context(loc, "expression only allowed in specifications") {
+                assert!(context.has_errors());
+                EE::UnresolvedError
+            } else {
+                let bs_opt = bind_list(context, pbs);
+                let e = exp_(context, *pe);
+                match bs_opt {
+                    Some(bs) => EE::Lambda(bs, Box::new(e)),
+                    None => {
+                        assert!(context.has_errors());
+                        EE::UnresolvedError
+                    }
+                }
+            }
+        }
         PE::ExpList(pes) => {
-            assert!(!pes.is_empty());
-            EE::ExpList(pes.into_iter().map(|pe| exp_(context, pe)).collect())
+            assert!(pes.len() > 1);
+            EE::ExpList(exps(context, pes))
         }
 
         PE::Assign(lvalue, rhs) => {
@@ -643,250 +1199,100 @@ fn exp_(context: &mut Context, sp!(loc, pe_): P::Exp) -> E::Exp {
                 Some(LValue::FieldMutate(edotted)) => EE::FieldMutate(edotted, er),
             }
         }
-        PE::Return(pe) => EE::Return(exp(context, *pe)),
+        PE::Return(pe_opt) => {
+            let ev = match pe_opt {
+                None => Box::new(sp(loc, EE::Unit { trailing: false })),
+                Some(pe) => exp(context, *pe),
+            };
+            EE::Return(ev)
+        }
         PE::Abort(pe) => EE::Abort(exp(context, *pe)),
         PE::Break => EE::Break,
         PE::Continue => EE::Continue,
         PE::Dereference(pe) => EE::Dereference(exp(context, *pe)),
         PE::UnaryExp(op, pe) => EE::UnaryExp(op, exp(context, *pe)),
-        PE::BinopExp(pl, op, pr) => EE::BinopExp(exp(context, *pl), op, exp(context, *pr)),
+        PE::BinopExp(pl, op, pr) => {
+            if op.value.is_spec_only()
+                && !context.require_spec_context(
+                    loc,
+                    &format!(
+                        "`{}` operator only allowed in specifications",
+                        op.value.symbol()
+                    ),
+                )
+            {
+                assert!(context.has_errors());
+                EE::UnresolvedError
+            } else {
+                EE::BinopExp(exp(context, *pl), op, exp(context, *pr))
+            }
+        }
         PE::Borrow(mut_, pr) => EE::Borrow(mut_, exp(context, *pr)),
-        pdotted_ @ PE::MDot(_, _, _) | pdotted_ @ PE::Dot(_, _, _) => {
-            match exp_dotted(context, sp(loc, pdotted_)) {
-                Some(edotted) => EE::ExpDotted(Box::new(edotted)),
-                None => {
-                    assert!(context.has_errors());
-                    EE::UnresolvedError
-                }
+        pdotted_ @ PE::Dot(_, _) => match exp_dotted(context, sp(loc, pdotted_)) {
+            Some(edotted) => EE::ExpDotted(Box::new(edotted)),
+            None => {
+                assert!(context.has_errors());
+                EE::UnresolvedError
+            }
+        },
+        PE::Cast(e, ty) => EE::Cast(exp(context, *e), type_(context, ty)),
+        PE::Index(e, i) => {
+            if context
+                .require_spec_context(loc, "`_[_]` index operator only allowed in specifications")
+            {
+                EE::Index(exp(context, *e), exp(context, *i))
+            } else {
+                EE::UnresolvedError
             }
         }
         PE::Annotate(e, ty) => EE::Annotate(exp(context, *e), type_(context, ty)),
+        PE::Spec(spec_block) => {
+            let (spec_id, unbound_names) = context.bind_exp_spec(spec_block);
+            EE::Spec(spec_id, unbound_names)
+        }
         PE::UnresolvedError => panic!("ICE error should have been thrown"),
     };
     sp(loc, e_)
 }
 
-macro_rules! mdot {
-    ($loc:pat, $lhs:pat, $field:pat, $tys_opt:pat) => {
-        sp!($loc, P::Exp_::MDot($lhs, $field, $tys_opt))
-    };
-}
-
-fn exp_dotted(context: &mut Context, pdotted: P::Exp) -> Option<E::ExpDotted> {
-    let (edotted, tys_opt) = exp_dotted_rec(context, pdotted)?;
-    if let Some(_tys) = tys_opt {
-        context.error(vec![(
-            edotted.loc,
-            "Unexpected type arguments. Thus, expected a function applied to its arguments",
-        )]);
-        None
-    } else {
-        Some(edotted)
-    }
-}
-
-fn exp_dotted_rec(
-    context: &mut Context,
-    sp!(loc, pdotted_): P::Exp,
-) -> Option<(E::ExpDotted, Option<Vec<E::SingleType>>)> {
+fn exp_dotted(context: &mut Context, sp!(loc, pdotted_): P::Exp) -> Option<E::ExpDotted> {
     use E::ExpDotted_ as EE;
-    use P::{Exp_ as PE, Value_ as V};
-    let (edotted_, tys_opt) = match pdotted_ {
-        PE::Dot(plhs, field, ptys_opt) => {
-            let lhs = exp_dotted(context, *plhs)?;
-            let tys_opt = ptys_opt.map(|tys| single_types(context, tys));
-            (EE::Dot(Box::new(lhs), field), tys_opt)
-        }
-        PE::MDot(maybe_addr, m, ptys_opt) => {
-            let addr = match *maybe_addr {
-                sp!(_, P::Exp_::Value(sp!(_, V::Address(addr)))) => addr,
-                sp!(aloc, _) => {
-                    context.error(vec![
-                        (loc, "Invalid access. Expected a qualified module access"),
-                        (aloc, "Or an struct value or reference"),
-                        (m.loc, "Followed by a field access"),
-                    ]);
-                    return None;
-                }
-            };
-            let tys_opt = ptys_opt.map(|tys| single_types(context, tys));
-            let mn = ModuleName(m);
-            let mi_ = ModuleIdent_ {
-                address: addr,
-                name: mn,
-            };
-            let mi = ModuleIdent(sp(loc, mi_));
-            (EE::Exp(sp(loc, E::Exp_::ModuleIdent(mi))), tys_opt)
-        }
-        pe_ => (EE::Exp(exp_(context, sp(loc, pe_))), None),
-    };
-    Some((sp(loc, edotted_), tys_opt))
-}
-
-fn exp_to_type_name(
-    context: &mut Context,
-    sp!(loc, p_): P::Exp,
-) -> Option<(E::TypeName, Option<Vec<E::SingleType>>)> {
-    use E::TypeName_ as ET;
     use P::Exp_ as PE;
-    match p_ {
-        PE::Name(n) | PE::MName(n) => Some((sp(loc, ET::Name(n)), None)),
-        PE::MNameTypeArgs(n, ptys) | PE::NameTypeArgs(n, ptys) => {
-            let tys = single_types(context, ptys);
-            Some((sp(loc, ET::Name(n)), Some(tys)))
+    let edotted_ = match pdotted_ {
+        PE::Dot(plhs, field) => {
+            let lhs = exp_dotted(context, *plhs)?;
+            EE::Dot(Box::new(lhs), field)
         }
-        pdotted_ @ PE::MDot(_, _, _) | pdotted_ @ PE::Dot(_, _, _) => {
-            exp_dotted_to_type_name(context, sp(loc, pdotted_))
-        }
-        _ => {
-            context.error(vec![
-                (loc, "Invalid type name. Expected: a name, a name with type arguments, or a module identifier and struct name"),
-            ]);
-            None
-        }
-    }
+        pe_ => EE::Exp(exp_(context, sp(loc, pe_))),
+    };
+    Some(sp(loc, edotted_))
 }
 
-fn exp_dotted_to_type_name(
-    context: &mut Context,
-    pdotted: P::Exp,
-) -> Option<(E::TypeName, Option<Vec<E::SingleType>>)> {
-    use E::TypeName_ as ET;
-    use P::{Exp_ as PE, Value_ as V};
-    let (tn, ptys_opt) = match pdotted {
-        mdot!(loc, inner, nf, ptys_opt) => match *inner {
-            mdot!(mloc, maybe_addr, mf, None) => {
-                let addr = match *maybe_addr {
-                    sp!(_, PE::Value(sp!(_, V::Address(addr)))) => addr,
-                    sp!(loc, _) => {
-                        context.error(vec![(
-                            loc,
-                            "Invalid fully qualified module type name. Expected: an address",
-                        )]);
-                        return None;
-                    }
-                };
-                let mn = ModuleName(mf);
-                let mi_ = ModuleIdent_ {
-                    address: addr,
-                    name: mn,
-                };
-                let mi = ModuleIdent(sp(mloc, mi_));
-                let n = StructName(nf);
-                (sp(loc, ET::ModuleType(mi, n)), ptys_opt)
-            }
-            sp!(_, PE::MName(m)) => {
-                let mn = ModuleName(m);
-                let sn = StructName(nf);
-                let tn_ = type_name(context, sp(loc, P::TypeName_::ModuleType(mn, sn)))?.value;
-                (sp(loc, tn_), ptys_opt)
-            }
-            _ => {
-                context.error(vec![(
-                    loc,
-                    "Invalid module type name access. Expected: a (possibly qualified) struct name",
-                )]);
+fn value(context: &mut Context, sp!(loc, pvalue_): P::Value) -> Option<E::Value> {
+    use E::Value_ as EV;
+    use P::Value_ as PV;
+    let value_ = match pvalue_ {
+        PV::Address(addr) => EV::Address(addr),
+        PV::U8(u) => EV::U8(u),
+        PV::U64(u) => EV::U64(u),
+        PV::U128(u) => EV::U128(u),
+        PV::Bool(b) => EV::Bool(b),
+        PV::HexString(s) => match hex_string::decode(loc, &s) {
+            Ok(v) => EV::Bytearray(v),
+            Err(e) => {
+                context.errors.extend(e);
                 return None;
             }
         },
-        sp!(loc, _) => {
-            context.error(vec![(
-                loc,
-                "Invalid type name. Expected: a module identifier and struct name",
-            )]);
-            return None;
-        }
-    };
-    let tys_opt = ptys_opt.map(|tys| single_types(context, tys));
-    Some((tn, tys_opt))
-}
-
-//**************************************************************************************************
-// Call
-//**************************************************************************************************
-
-fn is_mname(plhs: &P::Exp) -> bool {
-    use P::Exp_ as PE;
-    match &plhs.value {
-        PE::MName(_) | PE::MNameTypeArgs(_, _) | PE::MDot(_, _, _) => true,
-        _ => false,
-    }
-}
-
-fn call_or_pack(context: &mut Context, plhs: P::Exp, prhs: P::Exp) -> Option<E::Exp_> {
-    Some(if is_mname(&plhs) {
-        let (tn, tys_opt) = exp_to_type_name(context, plhs)?;
-        let fields = exp_fields(context, prhs)?;
-        E::Exp_::Pack(tn, tys_opt, fields)
-    } else {
-        let (lhs, tys_opt) = call(context, plhs)?;
-        let rhs = exp(context, prhs);
-        E::Exp_::Call(Box::new(lhs), tys_opt, rhs)
-    })
-}
-
-fn call(
-    context: &mut Context,
-    sp!(loc, pe_): P::Exp,
-) -> Option<(E::Exp, Option<Vec<E::SingleType>>)> {
-    use E::Exp_ as EE;
-    use P::Exp_ as PE;
-    Some(match pe_ {
-        PE::NameTypeArgs(n, ptys) => {
-            let e = sp(loc, EE::Name(n));
-            let tys = single_types(context, ptys);
-            (e, Some(tys))
-        }
-        pdotted_ @ PE::Dot(_, _, _) => {
-            let (edotted, tys_opt) = exp_dotted_rec(context, sp(loc, pdotted_))?;
-            assert!(match &edotted.value {
-                E::ExpDotted_::Dot(_, _) => true,
-                _ => false,
-            });
-            (sp(loc, EE::ExpDotted(Box::new(edotted))), tys_opt)
-        }
-        _ => (exp_(context, sp(loc, pe_)), None),
-    })
-}
-
-fn exp_fields(context: &mut Context, sp!(loc, e_): P::Exp) -> Option<Fields<E::Exp>> {
-    use E::Exp_ as EE;
-    use P::Exp_ as PE;
-    let msg = "Invalid fields for struct construction. Expected: named arguments";
-    let fields = match e_ {
-        PE::Block((v, last)) => {
-            if !v.is_empty() {
-                context.error(vec![(loc, msg)]);
+        PV::ByteString(s) => match byte_string::decode(loc, &s) {
+            Ok(v) => EV::Bytearray(v),
+            Err(e) => {
+                context.errors.extend(e);
                 return None;
             }
-            match *last {
-                None => Fields::new(),
-                Some(sp!(_, PE::Name(n))) => {
-                    let f = Field(n.clone());
-                    let fa = sp(f.loc(), EE::Name(n));
-                    let mut fields = Fields::new();
-                    fields.add(f, (0, fa)).unwrap();
-                    fields
-                }
-                Some(_) => {
-                    context.error(vec![(loc, msg)]);
-                    return None;
-                }
-            }
-        }
-        PE::Fields(pfields) => {
-            let efields = pfields
-                .into_iter()
-                .map(|(f, e)| (f, exp_(context, e)))
-                .collect();
-            fields(context, loc, "struct construction", "argument", efields)
-        }
-        _ => {
-            context.error(vec![(loc, msg)]);
-            return None;
-        }
+        },
     };
-    Some(fields)
+    Some(sp(loc, value_))
 }
 
 //**************************************************************************************************
@@ -920,32 +1326,35 @@ fn fields<T>(
 // LValues
 //**************************************************************************************************
 
-fn bind_list(context: &mut Context, sp!(loc, pbs_): P::BindList) -> Option<E::BindList> {
-    let bs_: Option<Vec<E::Bind>> = pbs_.into_iter().map(|pb| bind(context, pb)).collect();
+fn bind_list(context: &mut Context, sp!(loc, pbs_): P::BindList) -> Option<E::LValueList> {
+    let bs_: Option<Vec<E::LValue>> = pbs_.into_iter().map(|pb| bind(context, pb)).collect();
     Some(sp(loc, bs_?))
 }
 
-fn bind(context: &mut Context, sp!(loc, pb_): P::Bind) -> Option<E::Bind> {
-    use E::Bind_ as EB;
+fn bind(context: &mut Context, sp!(loc, pb_): P::Bind) -> Option<E::LValue> {
+    use E::LValue_ as EL;
     use P::Bind_ as PB;
     let b_ = match pb_ {
-        PB::Var(v) => EB::Var(v),
+        PB::Var(v) => {
+            check_valid_local_name(context, &v);
+            EL::Var(sp(loc, E::ModuleAccess_::Name(v.0)), None)
+        }
         PB::Unpack(ptn, ptys_opt, pfields) => {
-            let tn = type_name(context, ptn)?;
-            let tys_opt = ptys_opt.map(|pss| single_types(context, pss));
-            let vfields: Option<Vec<(Field, E::Bind)>> = pfields
+            let tn = module_access(context, Access::ApplyNamed, ptn)?;
+            let tys_opt = optional_types(context, ptys_opt);
+            let vfields: Option<Vec<(Field, E::LValue)>> = pfields
                 .into_iter()
                 .map(|(f, pb)| Some((f, bind(context, pb)?)))
                 .collect();
             let fields = fields(context, loc, "deconstruction binding", "binding", vfields?);
-            EB::Unpack(tn, tys_opt, fields)
+            EL::Unpack(tn, tys_opt, fields)
         }
     };
     Some(sp(loc, b_))
 }
 
 enum LValue {
-    Assigns(E::AssignList),
+    Assigns(E::LValueList),
     FieldMutate(Box<E::ExpDotted>),
     Mutate(Box<E::Exp>),
 }
@@ -956,7 +1365,7 @@ fn lvalues(context: &mut Context, sp!(loc, e_): P::Exp) -> Option<LValue> {
     let al: LValue = match e_ {
         PE::Unit => L::Assigns(sp(loc, vec![])),
         PE::ExpList(pes) => {
-            let al_opt: Option<Vec<E::Assign>> =
+            let al_opt: Option<E::LValueList_> =
                 pes.into_iter().map(|pe| assign(context, pe)).collect();
             L::Assigns(sp(loc, al_opt?))
         }
@@ -964,7 +1373,7 @@ fn lvalues(context: &mut Context, sp!(loc, e_): P::Exp) -> Option<LValue> {
             let er = exp(context, *pr);
             L::Mutate(er)
         }
-        pdotted_ @ PE::Dot(_, _, _) => {
+        pdotted_ @ PE::Dot(_, _) => {
             let dotted = exp_dotted(context, sp(loc, pdotted_))?;
             L::FieldMutate(Box::new(dotted))
         }
@@ -973,68 +1382,366 @@ fn lvalues(context: &mut Context, sp!(loc, e_): P::Exp) -> Option<LValue> {
     Some(al)
 }
 
-fn assign(context: &mut Context, sp!(loc, e_): P::Exp) -> Option<E::Assign> {
-    use E::Assign_ as EA;
+fn assign(context: &mut Context, sp!(loc, e_): P::Exp) -> Option<E::LValue> {
+    use E::LValue_ as EL;
     use P::Exp_ as PE;
     let a_ = match e_ {
-        PE::Name(n) => EA::Var(Var(n)),
-        PE::Apply(lhs, rhs) => {
-            let (tn, tys_opt) = exp_to_type_name(context, *lhs)?;
-            let fields = assign_unpack_fields(context, *rhs)?;
-            EA::Unpack(tn, tys_opt, fields)
+        PE::Name(sp!(_, P::ModuleAccess_::ModuleAccess(..)), _)
+        | PE::Name(sp!(_, P::ModuleAccess_::QualifiedModuleAccess(..)), _)
+        | PE::Name(_, Some(_))
+            if !context.require_spec_context(
+                loc,
+                "only simple names allowed in assignment outside of specifications",
+            ) =>
+        {
+            assert!(context.has_errors());
+            return None;
+        }
+        PE::Name(pn, ptys_opt) => {
+            let en = module_access(context, Access::Term, pn)?;
+            let tys_opt = optional_types(context, ptys_opt);
+            EL::Var(en, tys_opt)
+        }
+        PE::Pack(pn, ptys_opt, pfields) => {
+            let en = module_access(context, Access::ApplyNamed, pn)?;
+            let tys_opt = optional_types(context, ptys_opt);
+            let efields = assign_unpack_fields(context, loc, pfields)?;
+            EL::Unpack(en, tys_opt, efields)
         }
         _ => {
-            context.error(vec![
-                (loc, "Invalid assignment lvalue. Expected: a local, a field write, or a deconstructing assignment"),
-            ]);
+            context.error(vec![(
+                loc,
+                "Invalid assignment lvalue. Expected: a local, a field write, or a deconstructing \
+                 assignment",
+            )]);
             return None;
         }
     };
     Some(sp(loc, a_))
 }
 
-fn assign_unpack_fields(context: &mut Context, sp!(loc, e_): P::Exp) -> Option<Fields<E::Assign>> {
-    use E::Assign_ as EA;
-    use P::Exp_ as PE;
-    let msg = "Invalid fields for deconstructing assignment. Expected: named arguments";
-    let fields = match e_ {
-        PE::Block((v, last)) => {
-            if !v.is_empty() {
-                context.error(vec![(loc, msg)]);
-                return None;
+fn assign_unpack_fields(
+    context: &mut Context,
+    loc: Loc,
+    pfields: Vec<(Field, P::Exp)>,
+) -> Option<Fields<E::LValue>> {
+    let afields = pfields
+        .into_iter()
+        .map(|(f, e)| Some((f, assign(context, e)?)))
+        .collect::<Option<_>>()?;
+    Some(fields(
+        context,
+        loc,
+        "deconstructing assignment",
+        "assignment binding",
+        afields,
+    ))
+}
+
+//**************************************************************************************************
+// Unbound names
+//**************************************************************************************************
+
+fn unbound_names_spec_block(unbound: &mut BTreeSet<Name>, sp!(_, sb_): &E::SpecBlock) {
+    sb_.members
+        .iter()
+        .for_each(|member| unbound_names_spec_block_member(unbound, member))
+}
+
+fn unbound_names_spec_block_member(unbound: &mut BTreeSet<Name>, sp!(_, m_): &E::SpecBlockMember) {
+    use E::SpecBlockMember_ as M;
+    match &m_ {
+        M::Condition {
+            exp,
+            additional_exps,
+            ..
+        } => {
+            unbound_names_exp(unbound, exp);
+            additional_exps
+                .iter()
+                .for_each(|e| unbound_names_exp(unbound, e));
+        }
+        // No unbound names
+        // And will error in the Move prover
+        M::Function { .. }
+        | M::Variable { .. }
+        | M::Let { .. }
+        | M::Include { .. }
+        | M::Apply { .. }
+        | M::Pragma { .. } => (),
+    }
+}
+
+fn unbound_names_exp(unbound: &mut BTreeSet<Name>, sp!(_, e_): &E::Exp) {
+    use E::Exp_ as EE;
+    match e_ {
+        EE::Value(_)
+        | EE::InferredNum(_)
+        | EE::Break
+        | EE::Continue
+        | EE::UnresolvedError
+        | EE::Name(sp!(_, E::ModuleAccess_::ModuleAccess(..)), _)
+        | EE::Unit { .. } => (),
+        EE::Copy(v) | EE::Move(v) => {
+            unbound.insert(v.0.clone());
+        }
+        EE::Name(sp!(_, E::ModuleAccess_::Name(n)), _) => {
+            unbound.insert(n.clone());
+        }
+        EE::Call(_, _, sp!(_, es_)) => unbound_names_exps(unbound, es_),
+        EE::Pack(_, _, es) => unbound_names_exps(unbound, es.iter().map(|(_, (_, e))| e)),
+        EE::IfElse(econd, et, ef) => {
+            unbound_names_exp(unbound, ef);
+            unbound_names_exp(unbound, et);
+            unbound_names_exp(unbound, econd)
+        }
+        EE::While(econd, eloop) => {
+            unbound_names_exp(unbound, eloop);
+            unbound_names_exp(unbound, econd)
+        }
+        EE::Loop(eloop) => unbound_names_exp(unbound, eloop),
+
+        EE::Block(seq) => unbound_names_sequence(unbound, seq),
+        EE::Lambda(ls, er) => {
+            unbound_names_exp(unbound, er);
+            // remove anything in `ls`
+            unbound_names_binds(unbound, ls);
+        }
+        EE::Assign(ls, er) => {
+            unbound_names_exp(unbound, er);
+            // remove anything in `ls`
+            unbound_names_assigns(unbound, ls);
+        }
+        EE::Return(e)
+        | EE::Abort(e)
+        | EE::Dereference(e)
+        | EE::UnaryExp(_, e)
+        | EE::Borrow(_, e)
+        | EE::Cast(e, _)
+        | EE::Annotate(e, _) => unbound_names_exp(unbound, e),
+        EE::FieldMutate(ed, er) => {
+            unbound_names_exp(unbound, er);
+            unbound_names_dotted(unbound, ed)
+        }
+        EE::Mutate(el, er) | EE::BinopExp(el, _, er) => {
+            unbound_names_exp(unbound, er);
+            unbound_names_exp(unbound, el)
+        }
+        EE::ExpList(es) => unbound_names_exps(unbound, es),
+        EE::ExpDotted(ed) => unbound_names_dotted(unbound, ed),
+        EE::Index(el, ei) => {
+            unbound_names_exp(unbound, ei);
+            unbound_names_exp(unbound, el)
+        }
+
+        EE::Spec(_, unbound_names) => unbound.extend(unbound_names.iter().cloned()),
+    }
+}
+
+fn unbound_names_exps<'a>(unbound: &mut BTreeSet<Name>, es: impl IntoIterator<Item = &'a E::Exp>) {
+    es.into_iter().for_each(|e| unbound_names_exp(unbound, e))
+}
+
+fn unbound_names_sequence(unbound: &mut BTreeSet<Name>, seq: &E::Sequence) {
+    seq.iter()
+        .rev()
+        .for_each(|s| unbound_names_sequence_item(unbound, s))
+}
+
+fn unbound_names_sequence_item(unbound: &mut BTreeSet<Name>, sp!(_, es_): &E::SequenceItem) {
+    use E::SequenceItem_ as ES;
+    match es_ {
+        ES::Seq(e) => unbound_names_exp(unbound, e),
+        ES::Declare(ls, _) => unbound_names_binds(unbound, ls),
+        ES::Bind(ls, er) => {
+            unbound_names_exp(unbound, er);
+            // remove anything in `ls`
+            unbound_names_binds(unbound, ls);
+        }
+    }
+}
+
+fn unbound_names_binds(unbound: &mut BTreeSet<Name>, sp!(_, ls_): &E::LValueList) {
+    ls_.iter()
+        .rev()
+        .for_each(|l| unbound_names_bind(unbound, l))
+}
+
+fn unbound_names_bind(unbound: &mut BTreeSet<Name>, sp!(_, l_): &E::LValue) {
+    use E::LValue_ as EL;
+    match l_ {
+        EL::Var(sp!(_, E::ModuleAccess_::Name(n)), _) => {
+            unbound.remove(&n);
+        }
+        EL::Var(sp!(_, E::ModuleAccess_::ModuleAccess(..)), _) => {
+            // Qualified vars are not considered in unbound set.
+        }
+        EL::Unpack(_, _, efields) => efields
+            .iter()
+            .for_each(|(_, (_, l))| unbound_names_bind(unbound, l)),
+    }
+}
+
+fn unbound_names_assigns(unbound: &mut BTreeSet<Name>, sp!(_, ls_): &E::LValueList) {
+    ls_.iter()
+        .rev()
+        .for_each(|l| unbound_names_assign(unbound, l))
+}
+
+fn unbound_names_assign(unbound: &mut BTreeSet<Name>, sp!(_, l_): &E::LValue) {
+    use E::LValue_ as EL;
+    match l_ {
+        EL::Var(sp!(_, E::ModuleAccess_::Name(n)), _) => {
+            unbound.insert(n.clone());
+        }
+        EL::Var(sp!(_, E::ModuleAccess_::ModuleAccess(..)), _) => {
+            // Qualified vars are not considered in unbound set.
+        }
+        EL::Unpack(_, _, efields) => efields
+            .iter()
+            .for_each(|(_, (_, l))| unbound_names_assign(unbound, l)),
+    }
+}
+
+fn unbound_names_dotted(unbound: &mut BTreeSet<Name>, sp!(_, edot_): &E::ExpDotted) {
+    use E::ExpDotted_ as ED;
+    match edot_ {
+        ED::Exp(e) => unbound_names_exp(unbound, e),
+        ED::Dot(d, _) => unbound_names_dotted(unbound, d),
+    }
+}
+
+//**************************************************************************************************
+// Valid names
+//**************************************************************************************************
+
+fn check_valid_local_name(context: &mut Context, v: &Var) {
+    fn is_valid(s: &str) -> bool {
+        s.starts_with('_') || s.starts_with(|c| matches!(c, 'a'..='z'))
+    }
+    if !is_valid(v.value()) {
+        let msg = format!(
+            "Invalid local name '{}'. Local names must start with 'a'..'z' (or '_')",
+            v,
+        );
+        context.error(vec![(v.loc(), msg)])
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+enum ModuleMemberKind {
+    Constant,
+    Function,
+    Struct,
+    Schema,
+}
+
+impl ModuleMemberKind {
+    pub fn case(&self) -> &'static str {
+        match self {
+            ModuleMemberKind::Function => "function",
+            ModuleMemberKind::Constant => "constant",
+            ModuleMemberKind::Struct => "struct",
+            ModuleMemberKind::Schema => "schema",
+        }
+    }
+}
+
+fn check_valid_module_member_name(
+    context: &mut Context,
+    member: ModuleMemberKind,
+    name: Name,
+) -> Option<Name> {
+    match check_valid_module_member_name_impl(context, member, &name, member.case()) {
+        Err(()) => None,
+        Ok(()) => Some(name),
+    }
+}
+
+fn check_valid_module_member_alias(
+    context: &mut Context,
+    member: ModuleMemberKind,
+    alias: Name,
+) -> Option<Name> {
+    match check_valid_module_member_name_impl(
+        context,
+        member,
+        &alias,
+        &format!("{} alias", member.case()),
+    ) {
+        Err(()) => None,
+        Ok(()) => Some(alias),
+    }
+}
+
+fn check_valid_module_member_name_impl(
+    context: &mut Context,
+    member: ModuleMemberKind,
+    n: &Name,
+    case: &str,
+) -> Result<(), ()> {
+    use ModuleMemberKind as M;
+    fn upper_first_letter(s: &str) -> String {
+        let mut chars = s.chars();
+        match chars.next() {
+            None => String::new(),
+            Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+        }
+    }
+    let lcase = case;
+    let ucase = &upper_first_letter(case);
+    match member {
+        M::Function => (),
+        M::Constant | M::Struct | M::Schema => {
+            if !is_valid_struct_constant_or_schema_name(&n.value) {
+                let msg = format!(
+                    "Invalid {} name '{}'. {} names must start with 'A'..'Z'",
+                    lcase, n, ucase,
+                );
+                context.error(vec![(n.loc, msg)]);
+                return Err(());
             }
-            match *last {
-                None => Fields::new(),
-                Some(sp!(_, PE::Name(n))) => {
-                    let f = Field(n.clone());
-                    let fa = sp(f.loc(), EA::Var(Var(n)));
-                    let mut fields = Fields::new();
-                    fields.add(f, (0, fa)).unwrap();
-                    fields
-                }
-                Some(_) => {
-                    context.error(vec![(loc, msg)]);
-                    return None;
-                }
-            }
         }
-        PE::Fields(pfields) => {
-            let afields = pfields
-                .into_iter()
-                .map(|(f, e)| Some((f, assign(context, e)?)))
-                .collect::<Option<_>>()?;
-            fields(
-                context,
-                loc,
-                "deconstructing assignment",
-                "assignment binding",
-                afields,
-            )
-        }
-        _ => {
-            context.error(vec![(loc, msg)]);
-            return None;
-        }
-    };
-    Some(fields)
+    }
+
+    // TODO move these names to a more central place?
+    for restricted in crate::naming::ast::BuiltinFunction_::all_names() {
+        check_restricted_name(context, "module member", n, restricted)?;
+    }
+    for restricted in crate::naming::ast::BuiltinTypeName_::all_names() {
+        check_restricted_name(context, "module member", n, restricted)?;
+    }
+
+    // Restricting Self for now in the case where we ever have impls
+    // Otherwise, we could allow it
+    check_restricted_self_name(context, "module member", n)?;
+
+    Ok(())
+}
+
+pub fn is_valid_struct_constant_or_schema_name(s: &str) -> bool {
+    s.starts_with(|c| matches!(c, 'A'..='Z'))
+}
+
+fn check_restricted_self_name(context: &mut Context, case: &str, n: &Name) -> Result<(), ()> {
+    check_restricted_name(context, case, n, ModuleName::SELF_NAME)
+}
+
+fn check_restricted_name(
+    context: &mut Context,
+    case: &str,
+    sp!(loc, n_): &Name,
+    restricted: &str,
+) -> Result<(), ()> {
+    if n_ != restricted {
+        return Ok(());
+    }
+    let msg = format!(
+        "Invalid {case} name '{restricted}'. '{restricted}' is restricted and cannot be used to \
+         name a {case}",
+        case = case,
+        restricted = restricted,
+    );
+    context.error(vec![(*loc, msg)]);
+    Err(())
 }

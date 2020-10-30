@@ -3,6 +3,7 @@
 # .gitignore file locally for IDE/Emacs/Vim generated files.
 **/target
 **/*.rs.bk
+/.idea
 
 # Ignore wallet mnemonic files used for deterministic key derivation
 *.mnemonic
@@ -38,9 +39,18 @@ Temporary Items
 .apdisk
 
 # Generated VM config in vm-genesis
-language/vm/vm-genesis/genesis/vm_config.toml
+language/tools/vm-genesis/genesis/vm_config.toml
 
 # Terraform
 .terraform/
 
 .idea/
+# Move Build Output
+move_build_output/
+
+# Docker incremental build temporary files and directories
+target-out-docker
+**/Dockerfile.tmp
+
+# Doc generation output
+*.md.old

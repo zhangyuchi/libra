@@ -8,12 +8,13 @@ use crate::{
     ledger_counters::{LedgerCounterBumps, LedgerCounters},
     schema::ledger_counters::LedgerCountersSchema,
 };
-use failure::prelude::*;
+use anyhow::Result;
 use libra_logger::prelude::*;
 use libra_types::transaction::Version;
 use schemadb::{SchemaBatch, DB};
 use std::sync::Arc;
 
+#[derive(Debug)]
 pub(crate) struct SystemStore {
     db: Arc<DB>,
 }
@@ -41,9 +42,9 @@ impl SystemStore {
             if let Some(counters) = self.db.get::<LedgerCountersSchema>(&base_version)? {
                 counters
             } else {
-                crit!(
-                    "Base version ({}) ledger counters not found. Assuming zeros.",
-                    base_version
+                warn!(
+                    base_version = base_version,
+                    "Base version ledger counters not found. Assuming zeros.",
                 );
                 LedgerCounters::new()
             }

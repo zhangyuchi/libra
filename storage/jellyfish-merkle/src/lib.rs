@@ -1,6 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 //! This module implements [`JellyfishMerkleTree`] backed by storage module. The tree itself doesn't
 //! persist anything, but realizes the logic of R/W only. The write path will produce all the
 //! intermediate results in a batch for storage layer to commit and the read path will return
@@ -69,17 +71,17 @@
 pub mod iterator;
 #[cfg(test)]
 mod jellyfish_merkle_test;
-#[cfg(test)]
+#[cfg(any(test, feature = "fuzzing"))]
 mod mock_tree_store;
 mod nibble_path;
 pub mod node_type;
 pub mod restore;
-#[cfg(test)]
-mod test_helper;
+#[cfg(any(test, feature = "fuzzing"))]
+pub mod test_helper;
 mod tree_cache;
 
-use failure::prelude::*;
-use libra_crypto::{hash::CryptoHash, HashValue};
+use anyhow::{bail, ensure, format_err, Result};
+use libra_crypto::HashValue;
 use libra_types::{
     account_state_blob::AccountStateBlob,
     proof::{SparseMerkleProof, SparseMerkleRangeProof},
@@ -93,7 +95,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use tree_cache::TreeCache;
 
 /// The hardcoded maximum height of a [`JellyfishMerkleTree`] in nibbles.
-const ROOT_NIBBLE_HEIGHT: usize = HashValue::LENGTH * 2;
+pub const ROOT_NIBBLE_HEIGHT: usize = HashValue::LENGTH * 2;
 
 /// `TreeReader` defines the interface between
 /// [`JellyfishMerkleTree`](struct.JellyfishMerkleTree.html)
@@ -164,7 +166,7 @@ where
     /// This is a convenient function that calls
     /// [`put_blob_sets`](struct.JellyfishMerkleTree.html#method.put_blob_sets) with a single
     /// `keyed_blob_set`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "fuzzing"))]
     pub fn put_blob_set(
         &self,
         blob_set: Vec<(HashValue, AccountStateBlob)>,
@@ -225,7 +227,7 @@ where
         blob_sets: Vec<Vec<(HashValue, AccountStateBlob)>>,
         first_version: Version,
     ) -> Result<(Vec<HashValue>, TreeUpdateBatch)> {
-        let mut tree_cache = TreeCache::new(self.reader, first_version);
+        let mut tree_cache = TreeCache::new(self.reader, first_version)?;
         for (idx, blob_set) in blob_sets.into_iter().enumerate() {
             assert!(
                 !blob_set.is_empty(),
@@ -420,7 +422,7 @@ where
         }
 
         // 2.2. both are unfinished(They have keys with same length so it's impossible to have one
-        // finished and ther other not). This means the incoming key forks at some point between the
+        // finished and the other not). This means the incoming key forks at some point between the
         // position where step 1 ends and the last nibble, inclusive. Then create a seris of
         // internal nodes the number of which equals to the length of the extra part of the
         // common prefix in step 2, a new leaf node for the incoming key, and update the
@@ -539,13 +541,10 @@ where
                         } else {
                             None
                         },
-                        SparseMerkleProof::new(
-                            Some((leaf_node.account_key(), leaf_node.blob_hash())),
-                            {
-                                siblings.reverse();
-                                siblings
-                            },
-                        ),
+                        SparseMerkleProof::new(Some(leaf_node.into()), {
+                            siblings.reverse();
+                            siblings
+                        }),
                     ));
                 }
                 Node::Null => {
@@ -595,10 +594,16 @@ where
         Ok(self.get_with_proof(key, version)?.0)
     }
 
-    #[cfg(test)]
     pub fn get_root_hash(&self, version: Version) -> Result<HashValue> {
+        self.get_root_hash_option(version)?
+            .ok_or_else(|| format_err!("Root node not found for version {}.", version))
+    }
+
+    pub fn get_root_hash_option(&self, version: Version) -> Result<Option<HashValue>> {
         let root_node_key = NodeKey::new_empty_path(version);
-        let root_node = self.reader.get_node(&root_node_key)?;
-        Ok(root_node.hash())
+        Ok(self
+            .reader
+            .get_node_option(&root_node_key)?
+            .map(|root_node| root_node.hash()))
     }
 }

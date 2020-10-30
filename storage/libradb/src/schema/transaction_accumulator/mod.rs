@@ -11,8 +11,8 @@
 //! ```
 
 use crate::schema::{ensure_slice_len_eq, TRANSACTION_ACCUMULATOR_CF_NAME};
+use anyhow::Result;
 use byteorder::{BigEndian, ReadBytesExt};
-use failure::prelude::*;
 use libra_crypto::HashValue;
 use libra_types::proof::position::Position;
 use schemadb::{
@@ -35,9 +35,8 @@ impl KeyCodec<TransactionAccumulatorSchema> for Position {
 
     fn decode_key(data: &[u8]) -> Result<Self> {
         ensure_slice_len_eq(data, size_of::<u64>())?;
-        Ok(Position::from_postorder_index(
-            (&data[..]).read_u64::<BigEndian>()?,
-        ))
+        let index = (&data[..]).read_u64::<BigEndian>()?;
+        Ok(Position::from_postorder_index(index)?)
     }
 }
 
