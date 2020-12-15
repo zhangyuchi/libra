@@ -1,11 +1,13 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{utils::project_root, Result};
+use anyhow::Context;
+use determinator::rules::DeterminatorRules;
 use guppy::graph::summaries::CargoOptionsSummary;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
 };
@@ -26,6 +28,8 @@ pub struct Config {
     /// Cargo configuration
     cargo: CargoConfig,
     grcov: CargoTool,
+    /// Determinator configuration
+    determinator: DeterminatorRules,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -98,6 +102,8 @@ pub struct SummariesConfig {
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub struct WorkspaceConfig {
+    /// Allowed characters in file paths. Regex must have ^ and $ anchors.
+    pub allowed_paths: String,
     /// Attributes to enforce on workspace crates
     pub enforced_attributes: EnforcedAttributesConfig,
     /// Banned dependencies
@@ -106,6 +112,8 @@ pub struct WorkspaceConfig {
     pub overlay: OverlayConfig,
     /// Test-only config in this workspace
     pub test_only: TestOnlyConfig,
+    /// Exceptions to whitespace linters
+    pub whitespace_exceptions: Vec<String>,
     /// Subsets of this workspace
     pub subsets: BTreeMap<String, SubsetConfig>,
 }
@@ -138,15 +146,15 @@ pub struct OverlayConfig {
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub struct TestOnlyConfig {
-    /// A list of test-only members
-    pub members: HashSet<PathBuf>,
+    /// A list of test-only workspace names
+    pub members: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub struct SubsetConfig {
     /// The members in this subset
-    pub members: HashSet<PathBuf>,
+    pub members: Vec<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
@@ -170,8 +178,11 @@ pub struct CargoConfig {
 
 impl Config {
     pub fn from_file(f: impl AsRef<Path>) -> Result<Self> {
-        let contents = fs::read(f)?;
-        Self::from_toml(&contents).map_err(Into::into)
+        let f = f.as_ref();
+        let contents =
+            fs::read(f).with_context(|| format!("could not read config file {}", f.display()))?;
+        Self::from_toml(&contents)
+            .with_context(|| format!("could not parse config file {}", f.display()))
     }
 
     pub fn from_toml(bytes: &[u8]) -> Result<Self> {
@@ -216,5 +227,9 @@ impl Config {
 
     pub fn grcov(&self) -> &CargoTool {
         &self.grcov
+    }
+
+    pub fn determinator_rules(&self) -> &DeterminatorRules {
+        &self.determinator
     }
 }

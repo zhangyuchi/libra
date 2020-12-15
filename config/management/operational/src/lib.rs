@@ -1,9 +1,8 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
-mod account;
 mod account_resource;
 mod auto_validate;
 pub mod command;
@@ -11,6 +10,7 @@ mod governance;
 pub mod json_rpc;
 mod keys;
 mod owner;
+mod print;
 mod validate_transaction;
 mod validator_config;
 mod validator_set;
@@ -19,8 +19,8 @@ mod network_checker;
 #[cfg(any(test, feature = "testing"))]
 pub mod test_helper;
 
-use libra_secure_json_rpc::VMStatusView;
-use libra_types::account_address::AccountAddress;
+use diem_secure_json_rpc::VMStatusView;
+use diem_types::account_address::AccountAddress;
 use serde::Serialize;
 
 /// Information for validating a transaction after it's been submitted, or

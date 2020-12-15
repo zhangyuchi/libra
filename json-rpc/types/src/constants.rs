@@ -1,12 +1,12 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 //! Defines constants for enum type values
-//! See the following Libra JSON-RPC response type documents for more details:
-//! * https://github.com/libra/libra/blob/master/json-rpc/docs/type_account.md#type-account
-//! * https://github.com/libra/libra/blob/master/json-rpc/docs/type_event.md#event-data
-//! * https://github.com/libra/libra/blob/master/json-rpc/docs/type_transaction.md#type-vmstatus
-//! * https://github.com/libra/libra/blob/master/json-rpc/docs/type_transaction.md#type-transactiondata
+//! See the following Diem JSON-RPC response type documents for more details:
+//! * https://github.com/diem/diem/blob/master/json-rpc/docs/type_account.md#type-account
+//! * https://github.com/diem/diem/blob/master/json-rpc/docs/type_event.md#event-data
+//! * https://github.com/diem/diem/blob/master/json-rpc/docs/type_transaction.md#type-vmstatus
+//! * https://github.com/diem/diem/blob/master/json-rpc/docs/type_transaction.md#type-transactiondata
 
 // AccountRole#type field values
 pub const ACCOUNT_ROLE_UNKNOWN: &str = "unknown";
@@ -19,7 +19,7 @@ pub const EVENT_DATA_UNKNOWN: &str = "unknown";
 pub const EVENT_DATA_BURN: &str = "burn";
 pub const EVENT_DATA_CANCEL_BURN: &str = "cancelburn";
 pub const EVENT_DATA_MINT: &str = "mint";
-pub const EVENT_DATA_TO_LBR_EXCHANGE_RATE_UPDATE: &str = "to_lbr_exchange_rate_update";
+pub const EVENT_DATA_TO_XDX_EXCHANGE_RATE_UPDATE: &str = "to_xdx_exchange_rate_update";
 pub const EVENT_DATA_PREBURN: &str = "preburn";
 pub const EVENT_DATA_RECEIVED_PAYMENT: &str = "receivedpayment";
 pub const EVENT_DATA_SENT_PAYMENT: &str = "sentpayment";
@@ -45,5 +45,5 @@ pub const TRANSACTION_DATA_USER: &str = "user";
 pub const TRANSACTION_DATA_UNKNOWN: &str = "unknown";
 
 // Script#type field values, only set unknown type here,
-// other types, plese see https://github.com/libra/libra/blob/master/language/stdlib/transaction_scripts/doc/transaction_script_documentation.md for all available script names.
+// other types, plese see https://github.com/diem/diem/blob/master/language/stdlib/transaction_scripts/doc/transaction_script_documentation.md for all available script names.
 pub const SCRIPT_UNKNOWN: &str = "unknown";

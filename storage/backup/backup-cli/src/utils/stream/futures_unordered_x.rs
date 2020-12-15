@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 /// This wraps around `futures::stream::futures_unorderd::FuturesUnordered` to provide similar
@@ -169,7 +169,7 @@ mod tests {
                     assert!(seen_max_concurrency.load(Ordering::Relaxed));
                 }
 
-                outputs.sort();
+                outputs.sort_unstable();
                 assert_eq!(outputs, (0..num_sleeps).collect::<Vec<_>>());
             });
         }

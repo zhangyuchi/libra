@@ -1,2 +1,0 @@
-publish move_src/modules
-run move_src/scripts/test.move --dry-run

@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -8,14 +8,14 @@ use crate::{
     validator_set::DecryptedValidatorInfo,
     TransactionContext,
 };
-use libra_config::config;
-use libra_crypto::{ed25519::Ed25519PublicKey, x25519};
-use libra_management::{error::Error, secure_backend::DISK};
-use libra_network_address::NetworkAddress;
-use libra_types::{account_address::AccountAddress, chain_id::ChainId, waypoint::Waypoint};
+use diem_config::config;
+use diem_crypto::{ed25519::Ed25519PublicKey, x25519};
+use diem_management::{error::Error, secure_backend::DISK};
+use diem_network_address::NetworkAddress;
+use diem_types::{account_address::AccountAddress, chain_id::ChainId, waypoint::Waypoint};
 use structopt::StructOpt;
 
-const TOOL_NAME: &str = "libra-operational-tool";
+const TOOL_NAME: &str = "diem-operational-tool";
 
 /// A helper to test the operational tool in tests
 pub struct OperationalTool {
@@ -185,16 +185,19 @@ impl OperationalTool {
         &self,
         waypoint: Waypoint,
         backend: &config::SecureBackend,
+        set_genesis: bool,
     ) -> Result<(), Error> {
         let args = format!(
             "
                 {command}
                 --waypoint {waypoint}
                 --validator-backend {backend_args}
+                {set_genesis}
             ",
             command = command(TOOL_NAME, CommandName::InsertWaypoint),
             waypoint = waypoint,
             backend_args = backend_args(backend)?,
+            set_genesis = optional_flag("set-genesis", set_genesis),
         );
         let command = Command::from_iter(args.split_whitespace());
         command.insert_waypoint()
@@ -219,12 +222,51 @@ impl OperationalTool {
         command.print_account()
     }
 
+    pub fn print_key(
+        &self,
+        key_name: &str,
+        backend: &config::SecureBackend,
+    ) -> Result<Ed25519PublicKey, Error> {
+        let args = format!(
+            "
+                {command}
+                --key-name {key_name}
+                --validator-backend {backend_args}
+            ",
+            command = command(TOOL_NAME, CommandName::PrintKey),
+            key_name = key_name,
+            backend_args = backend_args(backend)?,
+        );
+        let command = Command::from_iter(args.split_whitespace());
+        command.print_key()
+    }
+
+    pub fn print_waypoint(
+        &self,
+        waypoint_name: &str,
+        backend: &config::SecureBackend,
+    ) -> Result<Waypoint, Error> {
+        let args = format!(
+            "
+                {command}
+                --waypoint-name {waypoint_name}
+                --validator-backend {backend_args}
+            ",
+            command = command(TOOL_NAME, CommandName::PrintWaypoint),
+            waypoint_name = waypoint_name,
+            backend_args = backend_args(backend)?,
+        );
+        let command = Command::from_iter(args.split_whitespace());
+        command.print_waypoint()
+    }
+
     pub fn set_validator_config(
         &self,
         validator_address: Option<NetworkAddress>,
         fullnode_address: Option<NetworkAddress>,
         backend: &config::SecureBackend,
         disable_validate: bool,
+        disable_address_validation: bool,
     ) -> Result<TransactionContext, Error> {
         let args = format!(
             "
@@ -235,6 +277,7 @@ impl OperationalTool {
                 --json-server {host}
                 --validator-backend {backend_args}
                 {disable_validate}
+                {disable_address_validation}
             ",
             command = command(TOOL_NAME, CommandName::SetValidatorConfig),
             host = self.host,
@@ -243,6 +286,8 @@ impl OperationalTool {
             validator_address = optional_arg("validator-address", validator_address),
             backend_args = backend_args(backend)?,
             disable_validate = optional_flag("disable-validate", disable_validate),
+            disable_address_validation =
+                optional_flag("disable-address-validation", disable_address_validation),
         );
 
         let command = Command::from_iter(args.split_whitespace());

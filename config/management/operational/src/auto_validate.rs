@@ -1,8 +1,8 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{validate_transaction::ValidateTransaction, TransactionContext};
-use libra_management::error::Error;
+use diem_management::error::Error;
 use std::{thread::sleep, time};
 use structopt::StructOpt;
 
@@ -52,7 +52,9 @@ impl AutoValidate {
             }
 
             sleep(time::Duration::from_secs(self.sleep_interval));
-            time_slept += self.sleep_interval;
+            time_slept = time_slept
+                .checked_add(self.sleep_interval)
+                .expect("Integer overflow/underflow detected: unexpected amount of time slept!");
         }
 
         // Tried to find the execution result, but the transaction still hasn't been executed...

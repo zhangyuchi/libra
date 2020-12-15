@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::async_client::{types as jsonrpc, JsonRpcError, JsonRpcResponse};
@@ -8,7 +8,7 @@ pub enum Error {
     // Error when send http request failed
     NetworkError(reqwest::Error),
     // Response http status is not 200
-    InvalidHTTPStatus(String), // reqwest::Response),
+    InvalidHTTPStatus(String, reqwest::StatusCode),
     // Response body can't be decoded as json-rpc response
     InvalidHTTPResponse(reqwest::Error),
     // Decoded JSON-RPC does not match JSON-RPC spec
@@ -23,13 +23,36 @@ pub enum Error {
     StaleResponseError(JsonRpcResponse),
     // Server response chain id does not match previous response chain id
     ChainIdMismatch(JsonRpcResponse),
+    // There was a timeout waiting for the response
+    ResponseTimeout(String),
     // Unexpected error, should never happen, likely is a bug if it happens.
     UnexpectedError(UnexpectedError),
 }
 
 impl Error {
-    pub fn unexpected_lcs_error(e: lcs::Error) -> Self {
-        Error::UnexpectedError(UnexpectedError::LCSError(e))
+    pub fn unexpected_bcs_error(e: bcs::Error) -> Self {
+        Error::UnexpectedError(UnexpectedError::BCSError(e))
+    }
+    pub fn unexpected_invalid_response_id(resp: JsonRpcResponse) -> Self {
+        Error::UnexpectedError(UnexpectedError::InvalidResponseId(resp))
+    }
+    pub fn unexpected_invalid_response_id_type(resp: JsonRpcResponse) -> Self {
+        Error::UnexpectedError(UnexpectedError::InvalidResponseIdType(resp))
+    }
+    pub fn unexpected_response_id_not_found(resp: JsonRpcResponse) -> Self {
+        Error::UnexpectedError(UnexpectedError::ResponseIdNotFound(resp))
+    }
+    pub fn unexpected_invalid_batch_response(resps: Vec<JsonRpcResponse>) -> Self {
+        Error::UnexpectedError(UnexpectedError::InvalidBatchResponse(resps))
+    }
+    pub fn unexpected_duplicated_response_id(resp: JsonRpcResponse) -> Self {
+        Error::UnexpectedError(UnexpectedError::DuplicatedResponseId(resp))
+    }
+    pub fn unexpected_no_response(req: serde_json::Value) -> Self {
+        Error::UnexpectedError(UnexpectedError::NoResponse(req))
+    }
+    pub fn unexpected_uncategorized(err: String) -> Self {
+        Error::UnexpectedError(UnexpectedError::Uncategorized(err))
     }
 }
 
@@ -54,7 +77,14 @@ impl std::error::Error for Error {
 
 #[derive(Debug)]
 pub enum UnexpectedError {
-    LCSError(lcs::Error),
+    BCSError(bcs::Error),
+    InvalidResponseId(JsonRpcResponse),
+    InvalidResponseIdType(JsonRpcResponse),
+    ResponseIdNotFound(JsonRpcResponse),
+    InvalidBatchResponse(Vec<JsonRpcResponse>),
+    DuplicatedResponseId(JsonRpcResponse),
+    NoResponse(serde_json::Value),
+    Uncategorized(String),
 }
 
 impl std::fmt::Display for UnexpectedError {
@@ -66,7 +96,8 @@ impl std::fmt::Display for UnexpectedError {
 impl std::error::Error for UnexpectedError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            UnexpectedError::LCSError(e) => Some(e),
+            UnexpectedError::BCSError(e) => Some(e),
+            _ => None,
         }
     }
 }

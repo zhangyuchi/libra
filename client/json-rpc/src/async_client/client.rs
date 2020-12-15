@@ -1,51 +1,43 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::async_client::{
-    defaults, types as jsonrpc, Error, JsonRpcResponse, RetryStrategy, State,
-    WaitForTransactionError,
+    defaults, types as jsonrpc, BroadcastHttpClient, Error, HttpClient, JsonRpcResponse, Request,
+    Response, RetryStrategy, SimpleHttpClient, State, WaitForTransactionError,
 };
-use libra_crypto::hash::CryptoHash;
-use libra_types::{
+use diem_crypto::hash::CryptoHash;
+use diem_types::{
     account_address::AccountAddress,
     transaction::{SignedTransaction, Transaction},
 };
+
 use serde::de::DeserializeOwned;
-use serde_json::json;
-use std::time::Duration;
 
-#[derive(Debug)]
-pub struct Response<R> {
-    pub result: R,
-    pub state: State,
-}
+use std::{convert::TryInto, sync::Arc, time::Duration};
 
-impl<R> std::ops::Deref for Response<R> {
-    type Target = R;
-
-    fn deref(&self) -> &Self::Target {
-        &self.result
-    }
-}
-
-#[derive(Debug)]
 pub struct Client<R> {
-    pub http_client: reqwest::Client,
-    pub server_url: reqwest::Url,
-    pub last_known_state: std::sync::RwLock<Option<State>>,
+    pub http_client: Arc<dyn HttpClient>,
     pub retry: R,
 }
 
 impl<R: RetryStrategy> Client<R> {
     pub fn from_url<T: reqwest::IntoUrl>(server_url: T, retry: R) -> Result<Self, reqwest::Error> {
         Ok(Self {
-            http_client: reqwest::ClientBuilder::new()
-                .use_native_tls()
-                .timeout(defaults::HTTP_REQUEST_TIMEOUT)
-                .build()
-                .expect("Unable to build Client."),
-            server_url: server_url.into_url()?,
-            last_known_state: std::sync::RwLock::new(None),
+            http_client: Arc::new(SimpleHttpClient::new(server_url)?),
+            retry,
+        })
+    }
+
+    pub fn from_url_list<T: reqwest::IntoUrl>(
+        server_urls: Vec<T>,
+        num_parallel_requests: usize,
+        retry: R,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            http_client: Arc::new(BroadcastHttpClient::new(
+                server_urls,
+                num_parallel_requests,
+            )?),
             retry,
         })
     }
@@ -96,7 +88,7 @@ impl<R: RetryStrategy> Client<R> {
                     state: txn_resp.state,
                 });
             }
-            if let Some(state) = self.last_known_state() {
+            if let Some(state) = self.http_client.last_known_state() {
                 if expiration_time_secs <= state.timestamp_usecs / 1_000_000 {
                     return Err(WaitForTransactionError::TransactionExpired(
                         state.timestamp_usecs,
@@ -109,26 +101,25 @@ impl<R: RetryStrategy> Client<R> {
     }
 
     pub fn last_known_state(&self) -> Option<State> {
-        let data = self.last_known_state.read().unwrap();
-        data.clone()
+        self.http_client.last_known_state()
     }
 
     pub async fn get_metadata(&self) -> Result<Response<jsonrpc::Metadata>, Error> {
-        self.send("get_metadata", json!([])).await
+        self.send(Request::get_metadata()).await
     }
 
     pub async fn get_metadata_by_version(
         &self,
         version: u64,
     ) -> Result<Response<jsonrpc::Metadata>, Error> {
-        self.send("get_metadata", json!([version])).await
+        self.send(Request::get_metadata_by_version(version)).await
     }
 
     pub async fn get_account(
         &self,
         address: &AccountAddress,
     ) -> Result<Response<Option<jsonrpc::Account>>, Error> {
-        self.send_opt("get_account", json!([address])).await
+        self.send_opt(Request::get_account(address)).await
     }
 
     pub async fn get_account_transaction(
@@ -137,10 +128,11 @@ impl<R: RetryStrategy> Client<R> {
         seq: u64,
         include_events: bool,
     ) -> Result<Response<Option<jsonrpc::Transaction>>, Error> {
-        self.send_opt(
-            "get_account_transaction",
-            json!([address, seq, include_events]),
-        )
+        self.send_opt(Request::get_account_transaction(
+            address,
+            seq,
+            include_events,
+        ))
         .await
     }
 
@@ -151,10 +143,12 @@ impl<R: RetryStrategy> Client<R> {
         limit: u64,
         include_events: bool,
     ) -> Result<Response<Vec<jsonrpc::Transaction>>, Error> {
-        self.send(
-            "get_account_transactions",
-            json!([address, start_seq, limit, include_events]),
-        )
+        self.send(Request::get_account_transactions(
+            address,
+            start_seq,
+            limit,
+            include_events,
+        ))
         .await
     }
 
@@ -164,11 +158,8 @@ impl<R: RetryStrategy> Client<R> {
         limit: u64,
         include_events: bool,
     ) -> Result<Response<Vec<jsonrpc::Transaction>>, Error> {
-        self.send(
-            "get_transactions",
-            json!([start_seq, limit, include_events]),
-        )
-        .await
+        self.send(Request::get_transactions(start_seq, limit, include_events))
+            .await
     }
 
     pub async fn get_events(
@@ -177,19 +168,18 @@ impl<R: RetryStrategy> Client<R> {
         start_seq: u64,
         limit: u64,
     ) -> Result<Response<Vec<jsonrpc::Event>>, Error> {
-        self.send("get_events", json!([key, start_seq, limit]))
-            .await
+        self.send(Request::get_events(key, start_seq, limit)).await
     }
 
     pub async fn get_currencies(&self) -> Result<Response<Vec<jsonrpc::CurrencyInfo>>, Error> {
-        self.send("get_currencies", json!([])).await
+        self.send(Request::get_currencies()).await
     }
 
     pub async fn get_state_proof(
         &self,
         from_version: u64,
     ) -> Result<Response<jsonrpc::StateProof>, Error> {
-        self.send("get_state_proof", json!([from_version])).await
+        self.send(Request::get_state_proof(from_version)).await
     }
 
     pub async fn get_account_state_with_proof(
@@ -198,46 +188,34 @@ impl<R: RetryStrategy> Client<R> {
         from_version: Option<u64>,
         to_version: Option<u64>,
     ) -> Result<Response<jsonrpc::AccountStateWithProof>, Error> {
-        self.send(
-            "get_account_state_with_proof",
-            json!([address, from_version, to_version]),
-        )
+        self.send(Request::get_account_state_with_proof(
+            address,
+            from_version,
+            to_version,
+        ))
         .await
     }
 
     pub async fn submit(&self, txn: &SignedTransaction) -> Result<Response<()>, Error> {
-        let txn_payload = hex::encode(lcs::to_bytes(&txn).map_err(Error::unexpected_lcs_error)?);
-        let resp = self
-            .send_without_retry("submit", &json!([txn_payload]))
-            .await?;
+        let req = Request::submit(txn).map_err(Error::unexpected_bcs_error)?;
+        let resp = self.http_client.single_request(&req).await?;
         Ok(Response {
             result: (),
             state: State::from_response(&resp),
         })
     }
 
-    pub async fn send<T: DeserializeOwned>(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<Response<T>, Error> {
-        let resp = self.send_with_retry(method, params).await?;
-        let state = State::from_response(&resp);
-        match resp.result {
-            Some(ret) => Ok(Response {
-                result: serde_json::from_value(ret).map_err(Error::DeserializeResponseJsonError)?,
-                state,
-            }),
-            None => Err(Error::ResultNotFound(resp)),
-        }
+    pub async fn send<T: DeserializeOwned>(&self, request: Request) -> Result<Response<T>, Error> {
+        self.send_with_retry(&request, &self.retry)
+            .await?
+            .try_into()
     }
 
     pub async fn send_opt<T: DeserializeOwned>(
         &self,
-        method: &str,
-        params: serde_json::Value,
+        request: Request,
     ) -> Result<Response<Option<T>>, Error> {
-        let resp = self.send_with_retry(method, params).await?;
+        let resp = self.send_with_retry(&request, &self.retry).await?;
         let state = State::from_response(&resp);
         let result = match resp.result {
             Some(ret) => {
@@ -248,85 +226,97 @@ impl<R: RetryStrategy> Client<R> {
         Ok(Response { result, state })
     }
 
-    pub async fn send_with_retry(
+    pub async fn send_with_retry<RS: RetryStrategy>(
         &self,
-        method: &str,
-        params: serde_json::Value,
+        request: &Request,
+        retry: &RS,
     ) -> Result<JsonRpcResponse, Error> {
         let mut retries: u32 = 0;
         loop {
-            let ret = self.send_without_retry(method, &params).await;
+            let ret = self.http_client.single_request(request).await;
             match ret {
-                Ok(r) => {
-                    return Ok(r);
-                }
-                Err(err) => {
-                    if !self.retry.is_retriable(&err) {
-                        return Err(err);
-                    }
-                    if retries < self.retry.max_retries(&err) {
-                        match retries.checked_add(1) {
-                            Some(i) if i < self.retry.max_retries(&err) => {
-                                retries = i;
-                            }
-                            _ => return Err(err),
-                        };
-                        tokio::time::delay_for(self.retry.delay(&err, retries)).await;
-                        continue;
-                    }
-                    return Err(err);
-                }
+                Ok(r) => return Ok(r),
+                Err(err) => retries = self.handle_retry_error(retries, err, retry).await?,
             }
         }
     }
 
-    pub async fn send_without_retry(
+    /// Batch requests into one JSON-RPC batch request.
+    /// To keep interface simple, this method returns error when any error occurs.
+    /// When batch responses contain partial success response, we will return the first
+    /// error it hit.
+    ///
+    /// Caller can convert `JsonRpcResponse` into `Response<T>`
+    /// in order of given requests:
+    ///
+    /// ```rust
+    /// use diem_json_rpc_client::async_client::{
+    ///     types as jsonrpc, Client, Error, Request, Response, Retry,
+    /// };
+    /// use std::convert::{TryInto};
+    ///
+    /// # async fn doc() -> Result<(), Error> {
+    /// let client = Client::from_url("http://testnet.diem.com/v1", Retry::default()).unwrap();
+    /// let mut res = client
+    ///     .batch_send(vec![Request::get_metadata(), Request::get_currencies()])
+    ///     .await?;
+    ///
+    /// let metadata: Response<jsonrpc::Metadata> = res
+    ///     .remove(0)
+    ///     .try_into()?;
+    ///
+    /// let currencies: Response<jsonrpc::CurrencyInfo> = res
+    ///     .remove(0)
+    ///     .try_into()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// For get_account and get_account_transaction request, the above convert will return
+    /// result not found error instead of None.
+    ///
+    /// This function calls to batch_send_with_retry, when you batch submit transactions,
+    /// to avoid re-submit errors, it is better to use batch_send_without_retry and handle errors
+    /// by yourself.
+    pub async fn batch_send(&self, requests: Vec<Request>) -> Result<Vec<JsonRpcResponse>, Error> {
+        self.batch_send_with_retry(&requests, &self.retry).await
+    }
+
+    pub async fn batch_send_with_retry<RS: RetryStrategy>(
         &self,
-        method: &str,
-        params: &serde_json::Value,
-    ) -> Result<JsonRpcResponse, Error> {
-        let resp = self
-            .http_client
-            .post(self.server_url.clone())
-            .json(&json!({"jsonrpc": "2.0", "method": method, "params": params, "id": 1}))
-            .send()
-            .await
-            .map_err(Error::NetworkError)?;
-        if resp.status() != 200 {
-            return Err(Error::InvalidHTTPStatus(format!("{:#?}", resp)));
-        }
-        let rpc_resp: JsonRpcResponse = resp.json().await.map_err(Error::InvalidHTTPResponse)?;
-
-        if rpc_resp.jsonrpc != "2.0" {
-            return Err(Error::InvalidRpcResponse(rpc_resp));
-        }
-
-        if let Some(state) = self.last_known_state() {
-            if rpc_resp.libra_chain_id != state.chain_id {
-                return Err(Error::ChainIdMismatch(rpc_resp));
+        requests: &[Request],
+        retry: &RS,
+    ) -> Result<Vec<JsonRpcResponse>, Error> {
+        let mut retries: u32 = 0;
+        loop {
+            let ret = self.http_client.batch_request(requests).await;
+            match ret {
+                Ok(r) => return Ok(r),
+                Err(err) => retries = self.handle_retry_error(retries, err, retry).await?,
             }
         }
-
-        let resp_state = State::from_response(&rpc_resp);
-        if !self.update_state(resp_state) {
-            return Err(Error::StaleResponseError(rpc_resp));
-        }
-
-        if let Some(err) = rpc_resp.error {
-            return Err(Error::JsonRpcError(err));
-        }
-
-        Ok(rpc_resp)
     }
 
-    pub fn update_state(&self, resp_state: State) -> bool {
-        let mut state_writer = self.last_known_state.write().unwrap();
-        if let Some(state) = &*state_writer {
-            if &resp_state < state {
-                return false;
-            }
+    async fn handle_retry_error<RS: RetryStrategy>(
+        &self,
+        mut retries: u32,
+        err: Error,
+        retry: &RS,
+    ) -> Result<u32, Error> {
+        if !retry.is_retriable(&err) {
+            return Err(err);
         }
-        *state_writer = Some(resp_state);
-        true
+        if retries < retry.max_retries(&err) {
+            match retries.checked_add(1) {
+                Some(i) if i < retry.max_retries(&err) => {
+                    retries = i;
+                }
+                _ => return Err(err),
+            };
+            tokio::time::delay_for(retry.delay(&err, retries)).await;
+            Ok(retries)
+        } else {
+            Err(err)
+        }
     }
 }

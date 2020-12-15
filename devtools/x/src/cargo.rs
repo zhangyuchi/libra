@@ -1,7 +1,8 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
+    cargo::selected_package::{SelectedInclude, SelectedPackages},
     config::CargoConfig,
     utils::{apply_sccache_if_possible, project_root},
     Result,
@@ -16,6 +17,9 @@ use std::{
     process::{Command, Output, Stdio},
     time::Instant,
 };
+
+pub mod build_args;
+pub mod selected_package;
 
 const RUST_TOOLCHAIN_VERSION: &str = include_str!("../../../rust-toolchain");
 const RUSTUP_TOOLCHAIN: &str = "RUSTUP_TOOLCHAIN";
@@ -112,41 +116,26 @@ impl Cargo {
         self
     }
 
-    pub fn workspace(&mut self) -> &mut Self {
-        self.inner.arg("--workspace");
-        self
-    }
-
-    pub fn all_targets(&mut self) -> &mut Self {
-        self.inner.arg("--all-targets");
-        self
-    }
-
     pub fn current_dir<P: AsRef<Path>>(&mut self, dir: P) -> &mut Self {
         self.inner.current_dir(dir);
         self
     }
 
-    pub fn packages<I, S>(&mut self, packages: I) -> &mut Self
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        for p in packages {
-            self.inner.arg("--package");
-            self.inner.arg(p);
-        }
-        self
-    }
-
-    pub fn exclusions<I, S>(&mut self, exclusions: I) -> &mut Self
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        for e in exclusions {
-            self.inner.arg("--exclude");
-            self.inner.arg(e);
+    pub fn packages(&mut self, packages: &SelectedPackages<'_>) -> &mut Self {
+        match &packages.includes {
+            SelectedInclude::Workspace => {
+                self.inner.arg("--workspace");
+                for &e in &packages.excludes {
+                    self.inner.args(&["--exclude", e]);
+                }
+            }
+            SelectedInclude::Includes(includes) => {
+                for &p in includes {
+                    if !packages.excludes.contains(p) {
+                        self.inner.args(&["--package", p]);
+                    }
+                }
+            }
         }
         self
     }
@@ -219,6 +208,7 @@ impl Cargo {
 
     /// Runs this command, capturing the standard output into a `Vec<u8>`.
     /// No logging/timing will be displayed as the result of this call from x.
+    #[allow(dead_code)]
     pub fn run_with_output(&mut self) -> Result<Vec<u8>> {
         self.inner.stderr(Stdio::inherit());
         // Since system out hijacked don't log for this command
@@ -237,15 +227,15 @@ impl Cargo {
 
         // once all the arguments are added to the command we can log it.
         if log {
-            self.env_additions.iter().for_each(|t| {
-                if let Some(env_val) = t.1 {
-                    if SECRET_ENVS.contains(&t.0.to_str().unwrap_or_default()) && t.1.is_some() {
-                        info!("export {:?}=********", env_val);
+            self.env_additions.iter().for_each(|(name, value_option)| {
+                if let Some(env_val) = value_option {
+                    if SECRET_ENVS.contains(&name.to_str().unwrap_or_default()) {
+                        info!("export {:?}=********", name);
                     } else {
-                        info!("export {:?}={:?}", t.0, env_val);
+                        info!("export {:?}={:?}", name, env_val);
                     }
                 } else {
-                    info!("unset {:?}", t.0);
+                    info!("unset {:?}", name);
                 }
             });
             info!("Executing: {:?}", &self.inner);
@@ -284,10 +274,7 @@ impl Cargo {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct CargoArgs {
-    pub all_targets: bool,
-}
+// TODO: this should really be a struct instead of an enum with repeated fields.
 
 /// Represents an invocations of cargo that will call multiple other invocations of
 /// cargo based on groupings implied by the contents of <workspace-root>/x.toml.
@@ -298,9 +285,20 @@ pub enum CargoCommand<'a> {
         args: &'a [OsString],
         env: &'a [(&'a str, Option<&'a str>)],
     },
-    Check(&'a CargoConfig),
-    Clippy(&'a CargoConfig, &'a [OsString]),
-    Fix(&'a CargoConfig, &'a [OsString]),
+    Check {
+        cargo_config: &'a CargoConfig,
+        direct_args: &'a [OsString],
+    },
+    Clippy {
+        cargo_config: &'a CargoConfig,
+        direct_args: &'a [OsString],
+        args: &'a [OsString],
+    },
+    Fix {
+        cargo_config: &'a CargoConfig,
+        direct_args: &'a [OsString],
+        args: &'a [OsString],
+    },
     Test {
         cargo_config: &'a CargoConfig,
         direct_args: &'a [OsString],
@@ -319,36 +317,22 @@ impl<'a> CargoCommand<'a> {
     pub fn cargo_config(&self) -> &CargoConfig {
         match self {
             CargoCommand::Bench { cargo_config, .. } => cargo_config,
-            CargoCommand::Check(config) => config,
-            CargoCommand::Clippy(config, _) => config,
-            CargoCommand::Fix(config, _) => config,
+            CargoCommand::Check { cargo_config, .. } => cargo_config,
+            CargoCommand::Clippy { cargo_config, .. } => cargo_config,
+            CargoCommand::Fix { cargo_config, .. } => cargo_config,
             CargoCommand::Test { cargo_config, .. } => cargo_config,
             CargoCommand::Build { cargo_config, .. } => cargo_config,
         }
     }
 
-    pub fn run_on_local_package(&self, args: &CargoArgs) -> Result<()> {
-        let mut cargo = Cargo::new(self.cargo_config(), self.as_str(), false);
-        Self::apply_args(&mut cargo, args);
-        cargo
-            .args(self.direct_args())
-            .pass_through(self.pass_through_args())
-            .envs(self.get_extra_env().to_owned())
-            .run()
-    }
-
-    pub fn run_on_packages<I, S>(&self, packages: I, args: &CargoArgs) -> Result<()>
-    where
-        I: IntoIterator<Item = S> + Clone,
-        S: AsRef<OsStr>,
-    {
-        // Early return if we have no packages to run
-        if packages.clone().into_iter().count() == 0 {
+    pub fn run_on_packages(&self, packages: &SelectedPackages<'_>) -> Result<()> {
+        // Early return if we have no packages to run.
+        if !packages.should_invoke() {
+            info!("no packages to {}: exiting early", self.as_str());
             return Ok(());
         }
 
         let mut cargo = Cargo::new(self.cargo_config(), self.as_str(), true);
-        Self::apply_args(&mut cargo, args);
         cargo
             .current_dir(project_root())
             .args(self.direct_args())
@@ -358,41 +342,12 @@ impl<'a> CargoCommand<'a> {
             .run()
     }
 
-    pub fn run_on_all_packages(&self, args: &CargoArgs) -> Result<()> {
-        let mut cargo = Cargo::new(self.cargo_config(), self.as_str(), true);
-        Self::apply_args(&mut cargo, args);
-        cargo
-            .current_dir(project_root())
-            .workspace()
-            .args(self.direct_args())
-            .pass_through(self.pass_through_args())
-            .envs(self.get_extra_env().to_owned())
-            .run()
-    }
-
-    pub fn run_with_exclusions<I, S>(&self, exclusions: I, args: &CargoArgs) -> Result<()>
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<OsStr>,
-    {
-        let mut cargo = Cargo::new(self.cargo_config(), self.as_str(), true);
-        Self::apply_args(&mut cargo, args);
-        cargo
-            .current_dir(project_root())
-            .workspace()
-            .args(self.direct_args())
-            .exclusions(exclusions)
-            .pass_through(self.pass_through_args())
-            .envs(self.get_extra_env().to_owned())
-            .run()
-    }
-
     pub fn as_str(&self) -> &'static str {
         match self {
             CargoCommand::Bench { .. } => "bench",
-            CargoCommand::Check(_) => "check",
-            CargoCommand::Clippy(_, _) => "clippy",
-            CargoCommand::Fix(_, _) => "fix",
+            CargoCommand::Check { .. } => "check",
+            CargoCommand::Clippy { .. } => "clippy",
+            CargoCommand::Fix { .. } => "fix",
             CargoCommand::Test { .. } => "test",
             CargoCommand::Build { .. } => "build",
         }
@@ -401,9 +356,9 @@ impl<'a> CargoCommand<'a> {
     fn pass_through_args(&self) -> &[OsString] {
         match self {
             CargoCommand::Bench { args, .. } => args,
-            CargoCommand::Check(_) => &[],
-            CargoCommand::Clippy(_, args) => args,
-            CargoCommand::Fix(_, args) => args,
+            CargoCommand::Check { .. } => &[],
+            CargoCommand::Clippy { args, .. } => args,
+            CargoCommand::Fix { args, .. } => args,
             CargoCommand::Test { args, .. } => args,
             CargoCommand::Build { args, .. } => args,
         }
@@ -412,9 +367,9 @@ impl<'a> CargoCommand<'a> {
     fn direct_args(&self) -> &[OsString] {
         match self {
             CargoCommand::Bench { direct_args, .. } => direct_args,
-            CargoCommand::Check(_) => &[],
-            CargoCommand::Clippy(_, _) => &[],
-            CargoCommand::Fix(_, _) => &[],
+            CargoCommand::Check { direct_args, .. } => direct_args,
+            CargoCommand::Clippy { direct_args, .. } => direct_args,
+            CargoCommand::Fix { direct_args, .. } => direct_args,
             CargoCommand::Test { direct_args, .. } => direct_args,
             CargoCommand::Build { direct_args, .. } => direct_args,
         }
@@ -423,17 +378,11 @@ impl<'a> CargoCommand<'a> {
     pub fn get_extra_env(&self) -> &[(&str, Option<&str>)] {
         match self {
             CargoCommand::Bench { env, .. } => env,
-            CargoCommand::Check(_) => &[],
-            CargoCommand::Clippy(_, _) => &[],
-            CargoCommand::Fix(_, _) => &[],
+            CargoCommand::Check { .. } => &[],
+            CargoCommand::Clippy { .. } => &[],
+            CargoCommand::Fix { .. } => &[],
             CargoCommand::Test { env, .. } => env,
             CargoCommand::Build { env, .. } => env,
-        }
-    }
-
-    fn apply_args(cargo: &mut Cargo, args: &CargoArgs) {
-        if args.all_targets {
-            cargo.all_targets();
         }
     }
 }

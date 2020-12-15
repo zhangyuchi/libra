@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -14,14 +14,14 @@ use crate::{
     },
 };
 use anyhow::{anyhow, ensure, Result};
-use futures::StreamExt;
-use libra_logger::prelude::*;
-use libra_types::{
+use diem_logger::prelude::*;
+use diem_types::{
     epoch_change::Verifier,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
     transaction::Version,
     waypoint::Waypoint,
 };
+use futures::StreamExt;
 use std::{sync::Arc, time::Instant};
 use structopt::StructOpt;
 
@@ -156,7 +156,7 @@ impl EpochEndingRestoreController {
         let mut chunk = vec![];
 
         while let Some(record_bytes) = file.read_record_bytes().await? {
-            chunk.push(lcs::from_bytes(&record_bytes)?);
+            chunk.push(bcs::from_bytes(&record_bytes)?);
         }
 
         Ok(chunk)

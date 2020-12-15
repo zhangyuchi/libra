@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
@@ -17,16 +17,17 @@ use crate::{
     },
 };
 use anyhow::{anyhow, bail, ensure, Result};
-use executor::Executor;
-use executor_types::TransactionReplayer;
-use futures::StreamExt;
-use libra_logger::prelude::*;
-use libra_types::{
+use diem_logger::prelude::*;
+use diem_types::{
+    contract_event::ContractEvent,
     ledger_info::LedgerInfoWithSignatures,
     proof::{TransactionAccumulatorRangeProof, TransactionListProof},
     transaction::{Transaction, TransactionInfo, TransactionListWithProof, Version},
 };
-use libra_vm::LibraVM;
+use diem_vm::DiemVM;
+use executor::Executor;
+use executor_types::TransactionReplayer;
+use futures::StreamExt;
 use std::{
     cmp::{max, min},
     sync::Arc,
@@ -68,6 +69,7 @@ struct LoadedChunk {
     pub manifest: TransactionChunk,
     pub txns: Vec<Transaction>,
     pub txn_infos: Vec<TransactionInfo>,
+    pub event_vecs: Vec<Vec<ContractEvent>>,
     pub range_proof: TransactionAccumulatorRangeProof,
     pub ledger_info: LedgerInfoWithSignatures,
 }
@@ -81,11 +83,13 @@ impl LoadedChunk {
         let mut file = BufReader::new(storage.open_for_read(&manifest.transactions).await?);
         let mut txns = Vec::new();
         let mut txn_infos = Vec::new();
+        let mut event_vecs = Vec::new();
 
         while let Some(record_bytes) = file.read_record_bytes().await? {
-            let (txn, txn_info) = lcs::from_bytes(&record_bytes)?;
+            let (txn, txn_info, events) = bcs::from_bytes(&record_bytes)?;
             txns.push(txn);
             txn_infos.push(txn_info);
+            event_vecs.push(events);
         }
 
         ensure!(
@@ -97,7 +101,7 @@ impl LoadedChunk {
         );
 
         let (range_proof, ledger_info) = storage
-            .load_lcs_file::<(TransactionAccumulatorRangeProof, LedgerInfoWithSignatures)>(
+            .load_bcs_file::<(TransactionAccumulatorRangeProof, LedgerInfoWithSignatures)>(
                 &manifest.proof,
             )
             .await?;
@@ -108,7 +112,7 @@ impl LoadedChunk {
         // make a `TransactionListWithProof` to reuse its verification code.
         let txn_list_with_proof = TransactionListWithProof::new(
             txns,
-            None, /* events */
+            Some(event_vecs),
             Some(manifest.first_version),
             TransactionListProof::new(range_proof, txn_infos),
         );
@@ -116,11 +120,13 @@ impl LoadedChunk {
         // and disassemble it to get things back.
         let txns = txn_list_with_proof.transactions;
         let (range_proof, txn_infos) = txn_list_with_proof.proof.unpack();
+        let event_vecs = txn_list_with_proof.events.expect("unknown to be Some.");
 
         Ok(Self {
             manifest,
             txns,
             txn_infos,
+            event_vecs,
             range_proof,
             ledger_info,
         })
@@ -204,9 +210,11 @@ impl TransactionRestoreController {
                     chunk.manifest.first_version,
                     &chunk.txns[..num_txns_to_save],
                     &chunk.txn_infos[..num_txns_to_save],
+                    &chunk.event_vecs[..num_txns_to_save],
                 )?;
                 chunk.txns.drain(0..num_txns_to_save);
                 chunk.txn_infos.drain(0..num_txns_to_save);
+                chunk.event_vecs.drain(0..num_txns_to_save);
                 TRANSACTION_SAVE_VERSION.set(last_to_save as i64);
             }
             // Those to replay:
@@ -259,11 +267,11 @@ impl TransactionRestoreController {
         Ok(())
     }
 
-    fn transaction_replayer(&mut self, first_version: Version) -> Result<&mut Executor<LibraVM>> {
+    fn transaction_replayer(&mut self, first_version: Version) -> Result<&mut Executor<DiemVM>> {
         if self.state.transaction_replayer.is_none() {
             if let RestoreRunMode::Restore { restore_handler } = self.run_mode.as_ref() {
                 let replayer = Executor::new_on_unbootstrapped_db(
-                    DbReaderWriter::from_arc(Arc::clone(&restore_handler.libradb)),
+                    DbReaderWriter::from_arc(Arc::clone(&restore_handler.diemdb)),
                     restore_handler.get_tree_state(first_version)?,
                 );
                 self.state.transaction_replayer = Some(replayer);
@@ -288,7 +296,7 @@ impl TransactionRestoreController {
 #[derive(Default)]
 struct State {
     frozen_subtree_confirmed: bool,
-    transaction_replayer: Option<Executor<LibraVM>>,
+    transaction_replayer: Option<Executor<DiemVM>>,
 }
 
 struct TransactionRestorePreheatData {

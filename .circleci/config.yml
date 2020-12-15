@@ -9,7 +9,7 @@ aliases:
       only:
         - auto
         - canary
-  - &working_directory /opt/git/libra
+  - &working_directory /opt/git/diem
   - &image libra/build_environment:circleci-2
 
 version: 2.1
@@ -204,7 +204,7 @@ commands:
     steps:
       - save_cache:
           name: Save breaking change rev
-          key: testnet-{{ checksum "testnet_rev" }}
+          key: testnet-v1-{{ checksum "testnet_rev" }}
           # paths are relative to /home/circleci/project/
           paths:
             - breaking_change_rev
@@ -214,7 +214,7 @@ commands:
     steps:
       - restore_cache:
           name: Restore breaking change rev
-          key: testnet-{{ checksum "testnet_rev" }}
+          key: testnet-v1-{{ checksum "testnet_rev" }}
   send_message:
     description: Send message to the specified webhook, if no webhook is set simply return.
     parameters:
@@ -369,23 +369,13 @@ jobs:
       - build_setup
       - restore_cargo_package_cache
       - run:
-          command: RUST_BACKTRACE=1 cargo xbuild -j 16
+          command: RUST_BACKTRACE=1 cargo xcheck -j 16 --production
       - run:
-          command: RUST_BACKTRACE=1 cargo xbuild -j 16 -p cli
-      - run:
-          command: RUST_BACKTRACE=1 cargo xbuild -j 16 -p cluster-test
-      - run:
-          command: RUST_BACKTRACE=1 cargo xbuild -j 16 -p language-benchmarks
-      - run:
-          command: RUST_BACKTRACE=1 cargo xbuild -j 16 -p libra-fuzzer
-      - run:
-          command: RUST_BACKTRACE=1 cargo xbuild -j 16 -p libra-swarm
-      - run:
-          command: RUST_BACKTRACE=1 cargo xbuild -j 16 -p test-generation
+          command: RUST_BACKTRACE=1 cargo xcheck -j 16 --workspace --all-targets
       - run:
           command: |
             rustup target add powerpc-unknown-linux-gnu
-            RUST_BACKTRACE=1 cargo xbuild -j 16 -p transaction-builder -p move-vm-types --target powerpc-unknown-linux-gnu
+            RUST_BACKTRACE=1 cargo xcheck -j 16 -p transaction-builder -p move-vm-types --target powerpc-unknown-linux-gnu
       - build_teardown
   run-e2e-test:
     working_directory: *working_directory
@@ -457,15 +447,16 @@ jobs:
   run-unit-test:
     working_directory: *working_directory
     executor: unittest-executor
-    description: Run all unit tests, excluding E2E and flaky tests that are
+    description: Run affected unit tests, excluding E2E and flaky tests that are
       explicitly ignored.
     steps:
       - build_setup
       - restore_cargo_package_cache
       - run:
-          name: Run all unit tests
+          name: Run affected unit tests
           command: |
-            RUST_BACKTRACE=1 $CI_TIMEOUT cargo x test --jobs 12 --unit
+            eval $(.circleci/get_pr_info.sh -b)
+            RUST_BACKTRACE=1 $CI_TIMEOUT cargo x test --jobs 12 --unit --changed-since "origin/$TARGET_BRANCH"
   run-crypto-unit-test:
     working_directory: *working_directory
     executor: audit-executor
@@ -864,7 +855,7 @@ jobs:
           command: |
             set -x
             SUFFIX="$(date +"%Y-%m-%d")-$(git rev-parse --short=8 HEAD)"
-            PREFIX="ci-artifacts.libra.org/coverage";
+            PREFIX="ci-artifacts.diem.com/coverage";
             #Push grcov
             aws s3 cp --recursive ${CODECOV_OUTPUT}/grcovhtml "s3://${PREFIX}/unit-coverage/${SUFFIX}/";
             aws s3 cp --recursive ${CODECOV_OUTPUT}/grcovhtml "s3://${PREFIX}/unit-coverage/latest/";

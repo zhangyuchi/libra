@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
@@ -12,6 +12,7 @@ use structopt::StructOpt;
 mod bench;
 mod build;
 mod cargo;
+mod changed_since;
 mod check;
 mod clippy;
 mod config;
@@ -22,6 +23,7 @@ mod fmt;
 mod generate_summaries;
 mod installer;
 mod lint;
+mod playground;
 mod test;
 mod tools;
 mod utils;
@@ -46,6 +48,13 @@ enum Command {
     #[structopt(name = "check")]
     /// Run `cargo check`
     Check(check::Args),
+    /// List packages changed since merge base with the given commit
+    ///
+    /// Note that this compares against the merge base (common ancestor) of the specified commit.
+    /// For example, if origin/master is specified, the current working directory will be compared
+    /// against the point at which it branched off of origin/master.
+    #[structopt(name = "changed-since")]
+    ChangedSince(changed_since::Args),
     #[structopt(name = "clippy")]
     /// Run `cargo clippy`
     Clippy(clippy::Args),
@@ -64,6 +73,8 @@ enum Command {
     #[structopt(name = "lint")]
     /// Run lints
     Lint(lint::Args),
+    /// Run playground code
+    Playground(playground::Args),
     #[structopt(name = "generate-summaries")]
     /// Generate build summaries for important subsets
     GenerateSummaries(generate_summaries::Args),
@@ -73,7 +84,7 @@ enum Command {
 }
 
 fn main() -> Result<()> {
-    env_logger::from_env(env_logger::Env::default().default_filter_or("info"))
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .format(|buf, record| {
             let color = match record.level() {
                 Level::Warn => Color::Yellow,
@@ -101,12 +112,14 @@ fn main() -> Result<()> {
         Command::Tools(args) => tools::run(args, xctx),
         Command::Test(args) => test::run(args, xctx),
         Command::Build(args) => build::run(args, xctx),
+        Command::ChangedSince(args) => changed_since::run(args, xctx),
         Command::Check(args) => check::run(args, xctx),
         Command::Clippy(args) => clippy::run(args, xctx),
         Command::Fix(args) => fix::run(args, xctx),
         Command::Fmt(args) => fmt::run(args, xctx),
         Command::Bench(args) => bench::run(args, xctx),
         Command::Lint(args) => lint::run(args, xctx),
+        Command::Playground(args) => playground::run(args, xctx),
         Command::GenerateSummaries(args) => generate_summaries::run(args, xctx),
         Command::DiffSummary(args) => diff_summary::run(args, xctx),
     }

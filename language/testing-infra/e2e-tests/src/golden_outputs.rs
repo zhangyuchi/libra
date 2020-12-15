@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use goldenfile::Mint;
@@ -15,8 +15,6 @@ pub(crate) struct GoldenOutputs {
 
 fn golden_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.pop();
-    path.pop();
     path.push(GOLDEN_DIR_PATH.to_string());
     path
 }

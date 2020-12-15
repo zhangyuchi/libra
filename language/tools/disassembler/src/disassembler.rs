@@ -1,4 +1,4 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{bail, format_err, Result};
@@ -1008,7 +1008,8 @@ impl<Location: Clone + Eq> Disassembler<Location> {
 
     pub fn disassemble(&self) -> Result<String> {
         let name_opt = self.source_mapper.source_map.module_name_opt.as_ref();
-        let name = name_opt.map(|(addr, n)| format!("{}.{}", addr.short_str(), n.to_string()));
+        let name =
+            name_opt.map(|(addr, n)| format!("{}.{}", addr.short_str_lossless(), n.to_string()));
         let header = match name {
             Some(s) => format!("module {}", s),
             None => "script".to_owned(),

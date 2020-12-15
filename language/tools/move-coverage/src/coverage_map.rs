@@ -1,10 +1,10 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
 #![forbid(unsafe_code)]
 
 use anyhow::{format_err, Result};
-use libra_types::account_address::AccountAddress;
+use diem_types::account_address::AccountAddress;
 use move_core_types::identifier::{IdentStr, Identifier};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -13,7 +13,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::Path,
 };
-use vm::file_format::CodeOffset;
+use vm::file_format::{CodeOffset, CompiledModule};
 
 pub type FunctionCoverage = BTreeMap<u64, u64>;
 
@@ -33,6 +33,12 @@ pub struct ModuleCoverageMap {
 pub struct ExecCoverageMap {
     pub exec_id: String,
     pub module_maps: BTreeMap<(AccountAddress, Identifier), ModuleCoverageMap>,
+}
+
+#[derive(Debug)]
+pub struct ExecCoverageMapWithModules {
+    pub module_maps: BTreeMap<(String, AccountAddress, Identifier), ModuleCoverageMap>,
+    pub compiled_modules: BTreeMap<String, CompiledModule>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -92,7 +98,7 @@ impl CoverageMap {
             .and_then(|mut file| file.read_to_end(&mut bytes).ok())
             .ok_or_else(|| format_err!("Error while reading in coverage map binary"))
             .unwrap();
-        lcs::from_bytes(&bytes)
+        bcs::from_bytes(&bytes)
             .map_err(|_| format_err!("Error deserializing into coverage map"))
             .unwrap()
     }
@@ -156,6 +162,15 @@ impl ModuleCoverageMap {
         self.insert_multi(func_name, pc, 1);
     }
 
+    pub fn merge(&mut self, another: ModuleCoverageMap) {
+        for (key, val) in another.function_maps {
+            self.function_maps
+                .entry(key)
+                .or_insert_with(FunctionCoverage::new)
+                .extend(val);
+        }
+    }
+
     pub fn get_function_coverage(&self, func_name: &IdentStr) -> Option<&FunctionCoverage> {
         self.function_maps.get(func_name)
     }
@@ -192,6 +207,62 @@ impl ExecCoverageMap {
         pc: u64,
     ) {
         self.insert_multi(module_addr, module_name, func_name, pc, 1);
+    }
+
+    pub fn into_coverage_map_with_modules(
+        self,
+        modules: BTreeMap<AccountAddress, BTreeMap<Identifier, (String, CompiledModule)>>,
+    ) -> ExecCoverageMapWithModules {
+        let retained: BTreeMap<(String, AccountAddress, Identifier), ModuleCoverageMap> = self
+            .module_maps
+            .into_iter()
+            .filter_map(|((module_addr, module_name), module_cov)| {
+                modules.get(&module_addr).and_then(|func_map| {
+                    func_map.get(&module_name).map(|(module_path, _)| {
+                        ((module_path.clone(), module_addr, module_name), module_cov)
+                    })
+                })
+            })
+            .collect();
+
+        let compiled_modules = modules
+            .into_iter()
+            .map(|(_, module_map)| {
+                module_map
+                    .into_iter()
+                    .map(|(_, (module_path, compiled_module))| (module_path, compiled_module))
+            })
+            .flatten()
+            .collect();
+
+        ExecCoverageMapWithModules {
+            module_maps: retained,
+            compiled_modules,
+        }
+    }
+}
+
+impl ExecCoverageMapWithModules {
+    pub fn empty() -> Self {
+        Self {
+            module_maps: BTreeMap::new(),
+            compiled_modules: BTreeMap::new(),
+        }
+    }
+
+    pub fn merge(&mut self, another: ExecCoverageMapWithModules) {
+        for ((module_path, module_addr, module_name), val) in another.module_maps {
+            self.module_maps
+                .entry((module_path.clone(), module_addr, module_name.clone()))
+                .or_insert_with(|| ModuleCoverageMap::new(module_addr, module_name))
+                .merge(val);
+        }
+
+        for (module_path, compiled_module) in another.compiled_modules {
+            self.compiled_modules
+                .entry(module_path)
+                .or_insert(compiled_module);
+        }
     }
 }
 
@@ -239,7 +310,7 @@ impl TraceMap {
             .and_then(|mut file| file.read_to_end(&mut bytes).ok())
             .ok_or_else(|| format_err!("Error while reading in coverage map binary"))
             .unwrap();
-        lcs::from_bytes(&bytes)
+        bcs::from_bytes(&bytes)
             .map_err(|_| format_err!("Error deserializing into coverage map"))
             .unwrap()
     }
@@ -267,7 +338,7 @@ impl TraceMap {
 }
 
 pub fn output_map_to_file<M: Serialize, P: AsRef<Path>>(file_name: P, data: &M) -> Result<()> {
-    let bytes = lcs::to_bytes(data)?;
+    let bytes = bcs::to_bytes(data)?;
     let mut file = File::create(file_name)?;
     file.write_all(&bytes)?;
     Ok(())

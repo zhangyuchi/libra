@@ -1,7 +1,7 @@
-// Copyright (c) The Libra Core Contributors
+// Copyright (c) The Diem Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use libra_types::transaction::ScriptABI;
+use diem_types::transaction::ScriptABI;
 use serde_generate::CustomCode;
 use std::io::Read;
 
@@ -31,7 +31,7 @@ pub fn read_abis<P: AsRef<std::path::Path>>(dir_path: P) -> anyhow::Result<Vec<S
         let mut buffer = Vec::new();
         let mut f = std::fs::File::open(path)?;
         f.read_to_end(&mut buffer)?;
-        abis.push(lcs::from_bytes(&buffer)?);
+        abis.push(bcs::from_bytes(&buffer)?);
     }
     // Sorting scripts by alphabetical order.
     #[allow(clippy::unnecessary_sort_by)]
@@ -51,7 +51,7 @@ pub trait SourceInstaller {
     ) -> std::result::Result<(), Self::Error>;
 }
 
-/// How to read custom code to inject in Libra containers.
+/// How to read custom code to inject in Diem containers.
 pub fn read_custom_code_from_paths<'a, I>(package: &'a [&'a str], paths: I) -> CustomCode
 where
     I: Iterator<Item = std::path::PathBuf>,
